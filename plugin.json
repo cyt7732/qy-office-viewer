@@ -1,5 +1,6 @@
 {
   "name": "qy-office-viewer",
+  "version": "1.0.0",
   "description": "Office 文档全能预览与系统直开助手（Word/WPS/Excel/PDF）",
   "logo": "assets/logo.svg"
 }
