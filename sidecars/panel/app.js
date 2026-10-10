@@ -10,6 +10,7 @@ const $ = (id) => document.getElementById(id);
 let currentFile = null;
 let sniffedFiles = [];
 let currentZoom = 100;
+let isAutoFit = true;
 let currentWorkbook = null;
 let activeSheetName = null;
 let toastTimer = null;
@@ -65,7 +66,6 @@ function getUrlFileParam() {
   }
 }
 
-// Normalize path separators for comparison
 function normPath(p) {
   return (p || '').replace(/\\/g, '/').toLowerCase();
 }
@@ -114,7 +114,6 @@ function renderFileDropdown(preferPath = null) {
     return;
   }
 
-  // Group files by source: conversation vs workspace vs recent
   const groups = {
     conversation: { label: '💬 当前会话工件', items: [] },
     workspace: { label: '📁 当前工作区文档', items: [] },
@@ -128,11 +127,10 @@ function renderFileDropdown(preferPath = null) {
 
   let targetToSelect = null;
 
-  // 1. If explicit path requested (e.g. from ?file=... or direct user select)
+  // 1. Explicit path from URL or parameter
   if (preferPath) {
     const normPrefer = normPath(preferPath);
     targetToSelect = sniffedFiles.find((f) => normPath(f.path) === normPrefer);
-    // If not found in sniffed list, synthesize a custom item
     if (!targetToSelect) {
       const name = preferPath.split(/[\/\\]/).pop();
       const ext = '.' + name.split('.').pop().toLowerCase();
@@ -148,14 +146,13 @@ function renderFileDropdown(preferPath = null) {
     }
   }
 
-  // 2. If no explicit path, check if newest file is newer than currentFile
+  // 2. Default selection: auto-switch to newest file
   if (!targetToSelect) {
     const newestFile = sniffedFiles[0];
     if (!currentFile) {
       targetToSelect = newestFile;
     } else {
       const currentStillExists = sniffedFiles.some((f) => normPath(f.path) === normPath(currentFile.path));
-      // Auto-switch if newest file was updated after currentFile
       if (newestFile && newestFile.mtime > (currentFile.mtime || 0) + 1500) {
         targetToSelect = newestFile;
       } else if (currentStillExists) {
@@ -183,7 +180,6 @@ function renderFileDropdown(preferPath = null) {
 
   if (targetToSelect) {
     select.value = targetToSelect.path;
-    // Only reload if file actually changed
     if (!currentFile || normPath(currentFile.path) !== normPath(targetToSelect.path)) {
       loadFile(targetToSelect);
     }
@@ -274,7 +270,7 @@ function updateMetaDisplay(file) {
 // Render Engines
 // ---------------------------------------------------------------------------
 
-// 1. DOCX Renderer (docx-preview)
+// 1. DOCX Renderer (docx-preview with proper inWrapper & Auto-Fit)
 async function renderDocx(filePath) {
   const res = await sidecar.fetch(`/api/file/raw?path=${encodeURIComponent(filePath)}`);
   if (!res.ok) throw new Error('无法读取文件内容');
@@ -287,11 +283,10 @@ async function renderDocx(filePath) {
   const container = $('docx-render-target');
   container.innerHTML = '';
 
-  resetZoom();
-
   if (window.docx && window.docx.renderAsync) {
+    // Crucial: inWrapper: true guarantees each page is an independent white paper sheet
     await window.docx.renderAsync(arrayBuffer, container, null, {
-      inWrapper: false,
+      inWrapper: true,
       ignoreWidth: false,
       ignoreHeight: false,
       renderHeaders: true,
@@ -300,8 +295,44 @@ async function renderDocx(filePath) {
       renderEndnotes: true,
       useBase64URL: true,
     });
+
+    // Automatically fit to window width by default
+    isAutoFit = true;
+    requestAnimationFrame(() => {
+      fitDocxToWidth();
+    });
   } else {
     throw new Error('docx-preview 引擎未就绪');
+  }
+}
+
+// Fit docx to viewport width
+function fitDocxToWidth() {
+  const container = $('docx-render-target');
+  const section = container.querySelector('section.docx');
+  const viewport = $('viewport-container');
+  if (!section || !viewport) return;
+
+  const docWidth = section.offsetWidth || 816;
+  const availableWidth = viewport.clientWidth - 28;
+
+  if (docWidth > 0 && availableWidth > 0) {
+    const scale = Math.min(1.0, Math.max(0.25, availableWidth / docWidth));
+    applyDocxZoom(scale);
+    isAutoFit = true;
+  }
+}
+
+function applyDocxZoom(scale) {
+  currentZoom = Math.round(scale * 100);
+  $('zoom-label').textContent = `${currentZoom}%`;
+
+  const target = $('docx-render-target');
+  if ('zoom' in target.style) {
+    target.style.zoom = scale;
+  } else {
+    target.style.transform = `scale(${scale})`;
+    target.style.transformOrigin = 'top center';
   }
 }
 
@@ -405,19 +436,15 @@ function showLoading(msg) {
 // ---------------------------------------------------------------------------
 // Zoom Controls (DOCX)
 // ---------------------------------------------------------------------------
-function updateZoom(newZoom) {
-  currentZoom = Math.max(50, Math.min(200, newZoom));
-  $('zoom-label').textContent = `${currentZoom}%`;
-  const wrapper = $('docx-wrapper');
-  wrapper.style.transform = `scale(${currentZoom / 100})`;
-  wrapper.style.transformOrigin = 'top center';
+function updateZoom(newPercent) {
+  isAutoFit = false;
+  const scale = Math.max(0.25, Math.min(2.0, newPercent / 100));
+  applyDocxZoom(scale);
 }
 
 function resetZoom() {
-  currentZoom = 100;
-  $('zoom-label').textContent = '100%';
-  const wrapper = $('docx-wrapper');
-  wrapper.style.transform = 'scale(1)';
+  isAutoFit = false;
+  applyDocxZoom(1.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -548,8 +575,9 @@ async function renderRawDroppedFile(file) {
       $('docx-wrapper').style.display = 'flex';
       $('zoom-controls').style.display = 'flex';
       $('docx-render-target').innerHTML = '';
-      resetZoom();
-      await window.docx.renderAsync(arrayBuffer, $('docx-render-target'), null, { inWrapper: false });
+      await window.docx.renderAsync(arrayBuffer, $('docx-render-target'), null, { inWrapper: true });
+      isAutoFit = true;
+      requestAnimationFrame(() => fitDocxToWidth());
     } else if (ext === '.xlsx' || ext === '.xls' || ext === '.csv') {
       hideAllViewports();
       $('xlsx-wrapper').style.display = 'flex';
@@ -607,9 +635,11 @@ function initEvents() {
     if (e.key === 'Enter') $('btn-load-manual').click();
   });
 
-  $('btn-zoom-in').addEventListener('click', () => updateZoom(currentZoom + 15));
-  $('btn-zoom-out').addEventListener('click', () => updateZoom(currentZoom - 15));
+  // Zoom controls
+  $('btn-zoom-in').addEventListener('click', () => updateZoom(currentZoom + 10));
+  $('btn-zoom-out').addEventListener('click', () => updateZoom(currentZoom - 10));
   $('btn-zoom-reset').addEventListener('click', resetZoom);
+  $('btn-zoom-fit').addEventListener('click', fitDocxToWidth);
 
   setupDragAndDrop();
 
@@ -619,11 +649,20 @@ function initEvents() {
     if (!document.hidden) refreshFiles();
   });
 
+  // Watch for dynamic resize of the auxiliary side pane
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver(() => {
+      if (isAutoFit && currentFile && currentFile.ext === '.docx') {
+        fitDocxToWidth();
+      }
+    });
+    ro.observe($('viewport-container'));
+  }
+
   // URL query parameter watcher
   window.addEventListener('popstate', () => refreshFiles());
   window.addEventListener('hashchange', () => refreshFiles());
 
-  // Periodically check for URL search param changes (e.g. when host re-triggers sidecar view)
   setInterval(() => {
     const currentQueryFile = getUrlFileParam();
     if (currentQueryFile && currentQueryFile !== lastKnownQueryFile) {
