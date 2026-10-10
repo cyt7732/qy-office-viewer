@@ -350,6 +350,43 @@ app.api('/api/action/reveal', (data) => {
   });
 });
 
+// POST /api/action/copy-clipboard { text }
+app.api('/api/action/copy-clipboard', (data) => {
+  const text = data.text;
+  if (!text) {
+    return { ok: false, error: '文本内容为空' };
+  }
+
+  return new Promise((resolveResult) => {
+    const currentPlatform = platform();
+    if (currentPlatform === 'win32') {
+      const b64 = Buffer.from(text, 'utf8').toString('base64');
+      execFile('powershell.exe', ['-NoProfile', '-Command', `Set-Clipboard -Value ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${b64}')))`], (err) => {
+        if (err) {
+          console.error('[copy-clipboard] Failed:', err);
+          resolveResult({ ok: false, error: err.message });
+        } else {
+          resolveResult({ ok: true, message: '已成功复制到系统剪贴板' });
+        }
+      });
+    } else if (currentPlatform === 'darwin') {
+      const proc = execFile('pbcopy', [], (err) => {
+        if (err) resolveResult({ ok: false, error: err.message });
+        else resolveResult({ ok: true, message: '已复制到剪贴板' });
+      });
+      proc.stdin.write(text);
+      proc.stdin.end();
+    } else {
+      const proc = execFile('xclip', ['-selection', 'clipboard'], (err) => {
+        if (err) resolveResult({ ok: false, error: err.message });
+        else resolveResult({ ok: true, message: '已复制到剪贴板' });
+      });
+      proc.stdin.write(text);
+      proc.stdin.end();
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Recent Files Persistence
 // ---------------------------------------------------------------------------

@@ -240,7 +240,6 @@ function updateButtonsState(file) {
   $('btn-open-default').disabled = !hasFile;
   $('btn-reveal').disabled = !hasFile;
   $('btn-copy-path').disabled = !hasFile;
-  $('btn-ask-agent').disabled = !hasFile;
 
   if (file) {
     const ext = (file.ext || '').toLowerCase();
@@ -516,26 +515,48 @@ async function revealInExplorer() {
   }
 }
 
-function copyFilePath() {
-  if (!currentFile) return;
-  navigator.clipboard.writeText(currentFile.path).then(
-    () => toast('文件绝对路径已复制到剪贴板', 'success'),
-    (err) => toast(`复制失败: ${err.message}`, 'error')
-  );
+// Robust clipboard copy with fallback to native OS command via sidecar
+async function copyToClipboard(text) {
+  // 1. Try traditional execCommand (bypasses Permissions Policy in iframes)
+  let copied = false;
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.left = '-9999px';
+    ta.style.top = '0';
+    ta.setAttribute('readonly', '');
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, 99999);
+    copied = document.execCommand('copy');
+    document.body.removeChild(ta);
+  } catch {
+    copied = false;
+  }
+
+  if (copied) return true;
+
+  // 2. Fallback to Sidecar backend native OS clipboard API
+  try {
+    const res = await callApi('/api/action/copy-clipboard', {
+      method: 'POST',
+      body: { text },
+    });
+    return !!res.ok;
+  } catch (err) {
+    console.error('[copy-clipboard] Error:', err);
+    return false;
+  }
 }
 
-async function askAgentToPolish() {
-  if (!currentFile) return;
-  if (!sidecar.agent || !sidecar.agent.sendMessage) {
-    toast('宿主 Agent 接口不可用', 'error');
-    return;
-  }
-  const msg = `请针对我正在预览的文档 [${currentFile.name}]（路径：${currentFile.path}）进行审查与进一步优化润色：\n`;
-  try {
-    await sidecar.agent.sendMessage(msg);
-    toast('已将文档润色请求推送至当前会话', 'success');
-  } catch (err) {
-    toast(`推送失败: ${err.message}`, 'error');
+async function copyFilePath() {
+  if (!currentFile || !currentFile.path) return;
+  const ok = await copyToClipboard(currentFile.path);
+  if (ok) {
+    toast('文件绝对路径已复制到剪贴板', 'success');
+  } else {
+    toast('复制失败，请在上方手动选择路径复制', 'error');
   }
 }
 
@@ -636,7 +657,6 @@ function initEvents() {
   $('btn-open-default').addEventListener('click', openInDefaultApp);
   $('btn-reveal').addEventListener('click', revealInExplorer);
   $('btn-copy-path').addEventListener('click', copyFilePath);
-  $('btn-ask-agent').addEventListener('click', askAgentToPolish);
 
   $('file-select').addEventListener('change', (e) => {
     const selectedPath = e.target.value;
