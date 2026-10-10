@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>QY Office Viewer</title>
+  <link rel="stylesheet" href="/styles.css">
+  <!-- Antigravity Host Bridge -->
+  <script src="/preload.js"></script>
+  <!-- Offline Vendor Libraries -->
+  <script src="/vendor/jszip.min.js"></script>
+  <script src="/vendor/docx-preview.min.js"></script>
+  <script src="/vendor/xlsx.mini.min.js"></script>
+</head>
+<body>
+  <!-- Header Bar -->
+  <header class="header-bar">
+    <div class="brand">
+      <svg class="brand-icon" viewBox="0 0 64 64" fill="none">
+        <rect width="64" height="64" rx="14" fill="#2563EB"/>
+        <path d="M19 14 H37 L45 22 V48 C45 49.1 44.1 50 43 50 H19 C17.9 50 17 49.1 17 48 V16 C17 14.9 17.9 14 19 14 Z" fill="#FFFFFF"/>
+        <path d="M37 14 V20 C37 21.1 37.9 22 39 22 H45 Z" fill="#93C5FD"/>
+        <circle cx="43" cy="43" r="10" fill="#10B981"/>
+        <ellipse cx="43" cy="43" rx="5.5" ry="3.5" stroke="#FFFFFF" stroke-width="1.8"/>
+        <circle cx="43" cy="43" r="1.6" fill="#FFFFFF"/>
+      </svg>
+      <span>QY Office Viewer</span>
+    </div>
+    <div class="header-status" id="header-status">就绪</div>
+  </header>
+
+  <!-- P0 Action Bar -->
+  <section class="action-bar">
+    <button id="btn-open-default" class="primary-btn" disabled>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+        <polyline points="15 3 21 3 21 9"></polyline>
+        <line x1="10" y1="14" x2="21" y2="3"></line>
+      </svg>
+      <span id="btn-open-label">在系统默认程序中打开</span>
+    </button>
+    <div class="secondary-actions">
+      <button id="btn-reveal" class="sec-btn" title="在 Windows 资源管理器中定位并高亮" disabled>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+        </svg>
+        <span>定位文件</span>
+      </button>
+      <button id="btn-copy-path" class="sec-btn" title="复制绝对文件路径到剪贴板" disabled>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+          <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+        </svg>
+        <span>复制路径</span>
+      </button>
+      <button id="btn-ask-agent" class="sec-btn" title="将当前文档推回对话让 AI 润色" disabled>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+        </svg>
+        <span>AI 润色</span>
+      </button>
+    </div>
+  </section>
+
+  <!-- File Selector Bar -->
+  <section class="selector-bar">
+    <div class="file-dropdown-wrapper">
+      <select id="file-select" class="file-dropdown">
+        <option value="">正在嗅探文档...</option>
+      </select>
+    </div>
+    <button id="btn-refresh" class="icon-btn" title="重新嗅探工件与工作区">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="23 4 23 10 17 10"></polyline>
+        <polyline points="1 20 1 14 7 14"></polyline>
+        <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+      </svg>
+    </button>
+    <button id="btn-toggle-manual" class="icon-btn" title="手动输入文件路径">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="4" y1="9" x2="20" y2="9"></line>
+        <line x1="4" y1="15" x2="20" y2="15"></line>
+        <line x1="10" y1="3" x2="8" y2="21"></line>
+        <line x1="16" y1="3" x2="14" y2="21"></line>
+      </svg>
+    </button>
+  </section>
+
+  <!-- Manual Input Bar (Collapsible) -->
+  <section id="manual-path-bar" class="manual-path-bar" style="display: none;">
+    <input type="text" id="input-manual-path" class="manual-path-input" placeholder="输入或粘贴本地文件绝对路径（如 D:\file.docx）...">
+    <button id="btn-load-manual" class="sec-btn">载入</button>
+  </section>
+
+  <!-- Sub-Toolbar (Meta info & Zoom controls) -->
+  <section class="sub-toolbar">
+    <div id="file-meta-text" class="file-meta-pill">未选择文件</div>
+    <div id="zoom-controls" class="zoom-controls" style="display: none;">
+      <button id="btn-zoom-out" class="zoom-btn" title="缩小">-</button>
+      <span id="zoom-label" class="zoom-label">100%</span>
+      <button id="btn-zoom-in" class="zoom-btn" title="放大">+</button>
+      <button id="btn-zoom-reset" class="zoom-btn" title="重置">1:1</button>
+    </div>
+  </section>
+
+  <!-- Main Viewport -->
+  <main class="viewport-container" id="viewport-container">
+    <!-- Drop Overlay -->
+    <div id="drop-overlay" class="drop-overlay" style="display: none;">
+      <span>释放鼠标以载入文件预览</span>
+    </div>
+
+    <!-- Empty State -->
+    <div id="empty-state" class="empty-state">
+      <svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+        <polyline points="14 2 14 8 20 8"></polyline>
+        <line x1="12" y1="18" x2="12" y2="12"></line>
+        <line x1="9" y1="15" x2="15" y2="15"></line>
+      </svg>
+      <div>
+        <p style="font-weight: 500; margin-bottom: 4px;">暂无可预览的 Office 文档</p>
+        <p style="font-size: 11.5px;">支持在此拖拽文件，或在上方选择/输入文件路径</p>
+      </div>
+    </div>
+
+    <!-- Loading State -->
+    <div id="loading-state" class="loading-spinner" style="display: none;">
+      <div class="spinner"></div>
+      <span id="loading-text">正在加载文档渲染...</span>
+    </div>
+
+    <!-- DOCX Viewport -->
+    <div id="docx-wrapper" style="display: none;">
+      <div id="docx-render-target" class="docx-render-target"></div>
+    </div>
+
+    <!-- XLSX Viewport -->
+    <div id="xlsx-wrapper" style="display: none;">
+      <div id="sheet-tabs" class="sheet-tabs"></div>
+      <div id="xlsx-table-wrapper" class="xlsx-table-wrapper"></div>
+    </div>
+
+    <!-- PDF Viewport -->
+    <iframe id="pdf-iframe" style="display: none;" src="about:blank"></iframe>
+
+    <!-- Plain Text Viewport -->
+    <pre id="text-view" style="display: none;"></pre>
+  </main>
+
+  <!-- Floating Toast -->
+  <div id="toast" class="toast" style="display: none;"></div>
+
+  <!-- Frontend Logic -->
+  <script src="/app.js"></script>
+</body>
+</html>
