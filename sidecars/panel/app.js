@@ -305,10 +305,13 @@ async function renderDocx(filePath) {
       currentDocNaturalWidth = 816;
     }
 
-    // 默认开启横向排满
+    // 默认开启横向排满，多层渲染帧兜底保证视口宽度测量 100% 准确
     isAutoFit = true;
     requestAnimationFrame(() => {
       fitDocxToWidth();
+      setTimeout(() => {
+        if (isAutoFit) fitDocxToWidth();
+      }, 100);
     });
   } else {
     throw new Error('docx-preview 引擎未就绪');

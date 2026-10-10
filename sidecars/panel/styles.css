@@ -346,18 +346,18 @@ body {
   max-width: none !important;
 }
 
-/* Pure solid white page with natural auto-height */
+/* Pure solid white page with natural auto-height and full viewport coverage */
 .docx-render-target section.docx,
 section.docx {
   background: #ffffff !important;
   color: #111827 !important;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.45) !important;
-  margin: 0 auto 20px auto !important;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.45) !important;
+  margin: 0 auto 24px auto !important;
   box-sizing: border-box !important;
   user-select: text !important;
   overflow: visible !important;   /* Never hide overflow! */
   height: auto !important;       /* Expand to 100% of paragraphs */
-  min-height: auto !important;
+  min-height: 100% !important;   /* Seamless coverage of full viewport height */
 }
 
 /* Article inside section.docx stays strictly white with dark text */
