@@ -475,22 +475,16 @@ function resetZoom() {
 }
 
 // ---------------------------------------------------------------------------
-// Native System Actions (P0 - Instant Sub-10ms Dispatch)
+// Native System Actions (P0 - Instant Sub-10ms Silent Dispatch)
 // ---------------------------------------------------------------------------
 async function openInDefaultApp() {
   if (!currentFile || !currentFile.path) return;
-  const fileName = currentFile.name || '文档';
-  // 瞬间给出乐观反馈（0ms延迟感）
-  toast(`正在唤起外部程序打开 ${fileName}...`, 'info');
-
   try {
     const res = await callApi('/api/action/open-default', {
       method: 'POST',
       body: { path: currentFile.path },
     });
-    if (res.ok) {
-      toast(res.message || `已在系统默认程序中打开：${fileName}`, 'success');
-    } else {
+    if (!res.ok) {
       toast(res.error || '打开失败', 'error');
     }
   } catch (err) {
@@ -500,18 +494,12 @@ async function openInDefaultApp() {
 
 async function revealInExplorer() {
   if (!currentFile || !currentFile.path) return;
-  const fileName = currentFile.name || '文件';
-  // 瞬间给出乐观反馈（0ms延迟感）
-  toast(`正在资源管理器中定位 ${fileName}...`, 'info');
-
   try {
     const res = await callApi('/api/action/reveal', {
       method: 'POST',
       body: { path: currentFile.path },
     });
-    if (res.ok) {
-      toast(res.message || '已在资源管理器中高亮定位', 'success');
-    } else {
+    if (!res.ok) {
       toast(res.error || '定位失败', 'error');
     }
   } catch (err) {
@@ -710,7 +698,6 @@ function initEvents() {
   $('btn-zoom-fit').addEventListener('click', () => {
     isAutoFit = true;
     fitDocxToWidth();
-    toast('已调整为横向排满视口', 'info');
   });
 
   setupDragAndDrop();
