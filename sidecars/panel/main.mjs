@@ -53,10 +53,10 @@ app.api('/api/status', () => ({
 }), 'GET');
 
 // ---------------------------------------------------------------------------
-// File Sniffer API
+// File Sniffer API (Strictly Office Documents Only)
 // ---------------------------------------------------------------------------
 const OFFICE_EXTS = new Set([
-  '.docx', '.doc', '.xlsx', '.xls', '.csv', '.pdf', '.pptx', '.ppt', '.txt', '.md', '.json',
+  '.docx', '.doc', '.xlsx', '.xls', '.csv', '.pdf', '.pptx', '.ppt',
 ]);
 
 function getFileType(ext) {
@@ -73,10 +73,6 @@ function getFileType(ext) {
     case '.pptx':
     case '.ppt':
       return 'ppt';
-    case '.txt':
-    case '.md':
-    case '.json':
-      return 'text';
     default:
       return 'other';
   }
@@ -96,7 +92,7 @@ function safeStat(filePath) {
   }
 }
 
-function scanDirForFiles(dirPath, maxDepth = 2, currentDepth = 0, ignoreDirs = new Set(['.git', 'node_modules', '.venv', 'dist', 'build', '.data'])) {
+function scanDirForFiles(dirPath, maxDepth = 2, currentDepth = 0, ignoreDirs = new Set(['.git', 'node_modules', '.venv', 'dist', 'build', '.data', '.system_generated', '.user_uploaded', 'scratch'])) {
   if (currentDepth > maxDepth || !existsSync(dirPath)) return [];
   const results = [];
   try {
@@ -173,26 +169,29 @@ app.api('/api/files/sniff', (data) => {
     }
   }
 
-  // 3. Include recent history files
+  // 3. Include recent history files (only if they are valid office files)
   const recent = loadRecentFiles();
   for (const item of recent) {
     if (existsSync(item.path) && !fileMap.has(item.path)) {
-      const st = safeStat(item.path);
-      if (st) {
-        fileMap.set(item.path, {
-          name: basename(item.path),
-          path: item.path,
-          size: st.size,
-          mtime: st.mtime,
-          ext: extname(item.path).toLowerCase(),
-          type: getFileType(extname(item.path)),
-          source: 'recent',
-        });
+      const ext = extname(item.path).toLowerCase();
+      if (OFFICE_EXTS.has(ext)) {
+        const st = safeStat(item.path);
+        if (st) {
+          fileMap.set(item.path, {
+            name: basename(item.path),
+            path: item.path,
+            size: st.size,
+            mtime: st.mtime,
+            ext,
+            type: getFileType(ext),
+            source: 'recent',
+          });
+        }
       }
     }
   }
 
-  // Convert map to array and sort by modified time desc
+  // Convert map to array and sort by modified time desc (newest first)
   const allFiles = Array.from(fileMap.values()).sort((a, b) => b.mtime - a.mtime);
   return { files: allFiles };
 }, 'GET');
@@ -207,9 +206,6 @@ const MIME_TYPES = {
   '.doc': 'application/msword',
   '.xls': 'application/vnd.ms-excel',
   '.csv': 'text/csv; charset=utf-8',
-  '.txt': 'text/plain; charset=utf-8',
-  '.md': 'text/markdown; charset=utf-8',
-  '.json': 'application/json; charset=utf-8',
   '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   '.ppt': 'application/vnd.ms-powerpoint',
 };
@@ -281,7 +277,6 @@ app.api('/api/action/open-default', (data) => {
   return new Promise((resolveResult) => {
     const currentPlatform = platform();
     if (currentPlatform === 'win32') {
-      // Windows: cmd.exe /c start "" "<filePath>"
       exec(`cmd.exe /c start "" "${absPath.replace(/"/g, '\\"')}"`, (err) => {
         if (err) {
           console.error('[open-default] Failed:', err);
@@ -291,7 +286,6 @@ app.api('/api/action/open-default', (data) => {
         }
       });
     } else if (currentPlatform === 'darwin') {
-      // macOS: open "<filePath>"
       execFile('open', [absPath], (err) => {
         if (err) {
           resolveResult({ ok: false, error: err.message });
@@ -300,7 +294,6 @@ app.api('/api/action/open-default', (data) => {
         }
       });
     } else {
-      // Linux: xdg-open "<filePath>"
       execFile('xdg-open', [absPath], (err) => {
         if (err) {
           resolveResult({ ok: false, error: err.message });
@@ -324,13 +317,10 @@ app.api('/api/action/reveal', (data) => {
   return new Promise((resolveResult) => {
     const currentPlatform = platform();
     if (currentPlatform === 'win32') {
-      // Windows explorer.exe /select,"<filePath>"
-      exec(`explorer.exe /select,"${absPath.replace(/"/g, '\\"')}"`, (err) => {
-        // explorer.exe sometimes exits with code 1 even on success
+      exec(`explorer.exe /select,"${absPath.replace(/"/g, '\\"')}"`, () => {
         resolveResult({ ok: true, message: `已在资源管理器中高亮定位：${basename(absPath)}` });
       });
     } else if (currentPlatform === 'darwin') {
-      // macOS: open -R "<filePath>"
       execFile('open', ['-R', absPath], (err) => {
         if (err) {
           resolveResult({ ok: false, error: err.message });
@@ -339,7 +329,7 @@ app.api('/api/action/reveal', (data) => {
         }
       });
     } else {
-      execFile('xdg-open', [dirname(absPath)], (err) => {
+      execFile('xdg-open', [dirname(absPath)], () => {
         resolveResult({ ok: true, message: `已在文件管理器中打开` });
       });
     }

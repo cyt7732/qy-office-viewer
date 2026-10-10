@@ -13,6 +13,7 @@ let currentZoom = 100;
 let currentWorkbook = null;
 let activeSheetName = null;
 let toastTimer = null;
+let lastKnownQueryFile = null;
 
 // ---------------------------------------------------------------------------
 // Helpers & Toasts
@@ -55,11 +56,24 @@ async function callApi(path, { method = 'GET', body } = {}) {
   return data;
 }
 
+function getUrlFileParam() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('file') || params.get('path') || null;
+  } catch {
+    return null;
+  }
+}
+
+// Normalize path separators for comparison
+function normPath(p) {
+  return (p || '').replace(/\\/g, '/').toLowerCase();
+}
+
 // ---------------------------------------------------------------------------
 // Sniffer & File Discovery
 // ---------------------------------------------------------------------------
 async function refreshFiles(preferPath = null) {
-  $('header-status').textContent = '嗅探中...';
   try {
     let workspaceUris = [];
     if (sidecar.getWorkspaceUris) {
@@ -72,14 +86,17 @@ async function refreshFiles(preferPath = null) {
     if (workspaceUris.length > 0) params.set('workspaces', JSON.stringify(workspaceUris));
 
     const res = await callApi(`/api/files/sniff?${params.toString()}`);
-    sniffedFiles = res.files || [];
+    const newFiles = res.files || [];
+    sniffedFiles = newFiles;
 
-    renderFileDropdown(preferPath);
+    const urlFile = getUrlFileParam();
+    const effectivePrefer = preferPath || urlFile;
+
+    renderFileDropdown(effectivePrefer);
     $('header-status').textContent = `已发现 ${sniffedFiles.length} 个文档`;
   } catch (err) {
     console.error('[sniff] Error:', err);
-    $('header-status').textContent = '嗅探失败';
-    toast(`嗅探失败: ${err.message}`, 'error');
+    $('header-status').textContent = '嗅探出错';
   }
 }
 
@@ -109,8 +126,47 @@ function renderFileDropdown(preferPath = null) {
     grp.items.push(f);
   }
 
-  let defaultSelected = null;
+  let targetToSelect = null;
 
+  // 1. If explicit path requested (e.g. from ?file=... or direct user select)
+  if (preferPath) {
+    const normPrefer = normPath(preferPath);
+    targetToSelect = sniffedFiles.find((f) => normPath(f.path) === normPrefer);
+    // If not found in sniffed list, synthesize a custom item
+    if (!targetToSelect) {
+      const name = preferPath.split(/[\/\\]/).pop();
+      const ext = '.' + name.split('.').pop().toLowerCase();
+      targetToSelect = {
+        name,
+        path: preferPath,
+        ext,
+        size: 0,
+        mtime: Date.now(),
+        source: 'direct',
+      };
+      sniffedFiles.unshift(targetToSelect);
+    }
+  }
+
+  // 2. If no explicit path, check if newest file is newer than currentFile
+  if (!targetToSelect) {
+    const newestFile = sniffedFiles[0];
+    if (!currentFile) {
+      targetToSelect = newestFile;
+    } else {
+      const currentStillExists = sniffedFiles.some((f) => normPath(f.path) === normPath(currentFile.path));
+      // Auto-switch if newest file was updated after currentFile
+      if (newestFile && newestFile.mtime > (currentFile.mtime || 0) + 1500) {
+        targetToSelect = newestFile;
+      } else if (currentStillExists) {
+        targetToSelect = sniffedFiles.find((f) => normPath(f.path) === normPath(currentFile.path));
+      } else {
+        targetToSelect = newestFile;
+      }
+    }
+  }
+
+  // Build optgroups
   for (const [key, grp] of Object.entries(groups)) {
     if (grp.items.length === 0) continue;
     const optgroup = document.createElement('optgroup');
@@ -121,26 +177,16 @@ function renderFileDropdown(preferPath = null) {
       const icon = getFileIcon(f.ext);
       opt.textContent = `${icon} ${f.name} (${formatBytes(f.size)})`;
       optgroup.appendChild(opt);
-
-      if (preferPath && f.path === preferPath) {
-        defaultSelected = f;
-      }
     }
     select.appendChild(optgroup);
   }
 
-  // Select target: preferPath -> previously selected -> first file
-  if (!defaultSelected) {
-    if (currentFile && sniffedFiles.some((f) => f.path === currentFile.path)) {
-      defaultSelected = sniffedFiles.find((f) => f.path === currentFile.path);
-    } else {
-      defaultSelected = sniffedFiles[0];
+  if (targetToSelect) {
+    select.value = targetToSelect.path;
+    // Only reload if file actually changed
+    if (!currentFile || normPath(currentFile.path) !== normPath(targetToSelect.path)) {
+      loadFile(targetToSelect);
     }
-  }
-
-  if (defaultSelected) {
-    select.value = defaultSelected.path;
-    loadFile(defaultSelected);
   }
 }
 
@@ -182,8 +228,6 @@ async function loadFile(fileInfo) {
       await renderSpreadsheet(fileInfo.path, ext);
     } else if (ext === '.pdf') {
       renderPdf(fileInfo.path);
-    } else if (ext === '.txt' || ext === '.md' || ext === '.json') {
-      await renderText(fileInfo.path);
     } else {
       showEmptyState(`暂不支持在侧边栏直接预览 ${ext} 文件，请使用顶部按钮在本地默认程序中打开。`);
     }
@@ -245,7 +289,6 @@ async function renderDocx(filePath) {
 
   resetZoom();
 
-  // Call docx-preview
   if (window.docx && window.docx.renderAsync) {
     await window.docx.renderAsync(arrayBuffer, container, null, {
       inWrapper: false,
@@ -258,7 +301,7 @@ async function renderDocx(filePath) {
       useBase64URL: true,
     });
   } else {
-    throw new Error('docx-preview 引擎未加载');
+    throw new Error('docx-preview 引擎未就绪');
   }
 }
 
@@ -273,7 +316,7 @@ async function renderSpreadsheet(filePath, ext) {
   $('zoom-controls').style.display = 'none';
 
   if (!window.XLSX) {
-    throw new Error('XLSX 引擎未加载');
+    throw new Error('XLSX 引擎未就绪');
   }
 
   const data = new Uint8Array(arrayBuffer);
@@ -285,7 +328,6 @@ async function renderSpreadsheet(filePath, ext) {
     return;
   }
 
-  // Render sheet tabs
   const tabsContainer = $('sheet-tabs');
   tabsContainer.innerHTML = '';
   sheetNames.forEach((name, idx) => {
@@ -315,7 +357,6 @@ function renderSheetTable(sheetName) {
     editable: false,
   });
 
-  // Inject class and wrapper
   const tableContainer = $('xlsx-table-wrapper');
   tableContainer.innerHTML = html;
   const table = tableContainer.querySelector('table');
@@ -324,26 +365,13 @@ function renderSheetTable(sheetName) {
   }
 }
 
-// 3. PDF Renderer (Chromium native iframe)
+// 3. PDF Renderer
 function renderPdf(filePath) {
   hideAllViewports();
   const iframe = $('pdf-iframe');
   iframe.style.display = 'block';
   $('zoom-controls').style.display = 'none';
   iframe.src = `/api/file/raw?path=${encodeURIComponent(filePath)}`;
-}
-
-// 4. Text / Markdown Renderer
-async function renderText(filePath) {
-  const res = await sidecar.fetch(`/api/file/raw?path=${encodeURIComponent(filePath)}`);
-  if (!res.ok) throw new Error('无法读取文件内容');
-  const text = await res.text();
-
-  hideAllViewports();
-  const textView = $('text-view');
-  textView.style.display = 'block';
-  $('zoom-controls').style.display = 'none';
-  textView.textContent = text;
 }
 
 // ---------------------------------------------------------------------------
@@ -460,7 +488,6 @@ async function askAgentToPolish() {
 // Drag and Drop & Manual Path
 // ---------------------------------------------------------------------------
 function setupDragAndDrop() {
-  const container = $('viewport-container');
   const overlay = $('drop-overlay');
 
   window.addEventListener('dragover', (e) => {
@@ -482,23 +509,19 @@ function setupDragAndDrop() {
     if (files && files.length > 0) {
       const file = files[0];
       const name = file.name;
-      // In electron/browser, file.path is available when dropped from local explorer
       const localPath = file.path || '';
       if (localPath) {
-        // If local path is known, load via API
-        const ext = '.' + name.split('.').pop();
-        const customItem = {
+        const ext = '.' + name.split('.').pop().toLowerCase();
+        loadFile({
           name,
           path: localPath,
           size: file.size,
           mtime: file.lastModified,
           ext,
           source: 'manual',
-        };
-        loadFile(customItem);
+        });
         toast(`已载入文件：${name}`, 'info');
       } else {
-        // Directly render File object via buffer
         renderRawDroppedFile(file);
       }
     }
@@ -515,7 +538,7 @@ async function renderRawDroppedFile(file) {
     mtime: file.lastModified,
     ext,
   };
-  updateButtonsState(null); // Local blob can't be opened via system path
+  updateButtonsState(null);
   updateMetaDisplay(currentFile);
 
   try {
@@ -546,23 +569,19 @@ async function renderRawDroppedFile(file) {
 // Event Listeners Initialization
 // ---------------------------------------------------------------------------
 function initEvents() {
-  // P0 Action buttons
   $('btn-open-default').addEventListener('click', openInDefaultApp);
   $('btn-reveal').addEventListener('click', revealInExplorer);
   $('btn-copy-path').addEventListener('click', copyFilePath);
   $('btn-ask-agent').addEventListener('click', askAgentToPolish);
 
-  // File dropdown
   $('file-select').addEventListener('change', (e) => {
     const selectedPath = e.target.value;
     const found = sniffedFiles.find((f) => f.path === selectedPath);
     if (found) loadFile(found);
   });
 
-  // Refresh
   $('btn-refresh').addEventListener('click', () => refreshFiles());
 
-  // Manual path toggle
   $('btn-toggle-manual').addEventListener('click', () => {
     const bar = $('manual-path-bar');
     bar.style.display = bar.style.display === 'none' ? 'flex' : 'none';
@@ -573,7 +592,7 @@ function initEvents() {
     const inputPath = $('input-manual-path').value.trim();
     if (!inputPath) return;
     const name = inputPath.split(/[\/\\]/).pop();
-    const ext = '.' + name.split('.').pop();
+    const ext = '.' + name.split('.').pop().toLowerCase();
     loadFile({
       name,
       path: inputPath,
@@ -588,15 +607,31 @@ function initEvents() {
     if (e.key === 'Enter') $('btn-load-manual').click();
   });
 
-  // Zoom
   $('btn-zoom-in').addEventListener('click', () => updateZoom(currentZoom + 15));
   $('btn-zoom-out').addEventListener('click', () => updateZoom(currentZoom - 15));
   $('btn-zoom-reset').addEventListener('click', resetZoom);
 
-  // Drag and drop
   setupDragAndDrop();
 
-  // Host workspace change listener
+  // Focus & Visibility Auto-Refresh
+  window.addEventListener('focus', () => refreshFiles());
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) refreshFiles();
+  });
+
+  // URL query parameter watcher
+  window.addEventListener('popstate', () => refreshFiles());
+  window.addEventListener('hashchange', () => refreshFiles());
+
+  // Periodically check for URL search param changes (e.g. when host re-triggers sidecar view)
+  setInterval(() => {
+    const currentQueryFile = getUrlFileParam();
+    if (currentQueryFile && currentQueryFile !== lastKnownQueryFile) {
+      lastKnownQueryFile = currentQueryFile;
+      refreshFiles(currentQueryFile);
+    }
+  }, 1000);
+
   if (sidecar.onWorkspaceChange) {
     sidecar.onWorkspaceChange(() => {
       refreshFiles();
@@ -609,8 +644,8 @@ function initEvents() {
 // ---------------------------------------------------------------------------
 document.addEventListener('DOMContentLoaded', () => {
   initEvents();
-  // Delay slightly to ensure host workspace push has settled
   setTimeout(() => {
-    refreshFiles();
+    lastKnownQueryFile = getUrlFileParam();
+    refreshFiles(lastKnownQueryFile);
   }, 100);
 });
