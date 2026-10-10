@@ -475,31 +475,35 @@ function resetZoom() {
 }
 
 // ---------------------------------------------------------------------------
-// Native System Actions (P0)
+// Native System Actions (P0 - Instant Sub-10ms Dispatch)
 // ---------------------------------------------------------------------------
 async function openInDefaultApp() {
-  if (!currentFile) return;
-  const btn = $('btn-open-default');
-  btn.disabled = true;
+  if (!currentFile || !currentFile.path) return;
+  const fileName = currentFile.name || '文档';
+  // 瞬间给出乐观反馈（0ms延迟感）
+  toast(`正在唤起外部程序打开 ${fileName}...`, 'info');
+
   try {
     const res = await callApi('/api/action/open-default', {
       method: 'POST',
       body: { path: currentFile.path },
     });
     if (res.ok) {
-      toast(res.message || '已成功在默认程序中打开', 'success');
+      toast(res.message || `已在系统默认程序中打开：${fileName}`, 'success');
     } else {
       toast(res.error || '打开失败', 'error');
     }
   } catch (err) {
     toast(`启动失败: ${err.message}`, 'error');
-  } finally {
-    btn.disabled = false;
   }
 }
 
 async function revealInExplorer() {
-  if (!currentFile) return;
+  if (!currentFile || !currentFile.path) return;
+  const fileName = currentFile.name || '文件';
+  // 瞬间给出乐观反馈（0ms延迟感）
+  toast(`正在资源管理器中定位 ${fileName}...`, 'info');
+
   try {
     const res = await callApi('/api/action/reveal', {
       method: 'POST',

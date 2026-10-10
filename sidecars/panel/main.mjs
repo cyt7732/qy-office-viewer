@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { homedir, platform, release } from 'node:os';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { exec, execFile } from 'node:child_process';
+import { exec, execFile, spawn } from 'node:child_process';
 import { Response, SidecarApp } from 'sidecar_sdk';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -288,35 +288,27 @@ app.api('/api/action/open-default', (data) => {
   const absPath = resolve(targetPath);
   addRecentFile(absPath);
 
-  return new Promise((resolveResult) => {
-    const currentPlatform = platform();
+  const currentPlatform = platform();
+  try {
     if (currentPlatform === 'win32') {
-      exec(`cmd.exe /c start "" "${absPath.replace(/"/g, '\\"')}"`, (err) => {
-        if (err) {
-          console.error('[open-default] Failed:', err);
-          resolveResult({ ok: false, error: err.message });
-        } else {
-          resolveResult({ ok: true, message: `已在系统默认程序中打开：${basename(absPath)}` });
-        }
+      const child = spawn('cmd.exe', ['/c', 'start', '', absPath], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
       });
+      child.unref();
     } else if (currentPlatform === 'darwin') {
-      execFile('open', [absPath], (err) => {
-        if (err) {
-          resolveResult({ ok: false, error: err.message });
-        } else {
-          resolveResult({ ok: true, message: `已在系统程序中打开：${basename(absPath)}` });
-        }
-      });
+      const child = spawn('open', [absPath], { detached: true, stdio: 'ignore' });
+      child.unref();
     } else {
-      execFile('xdg-open', [absPath], (err) => {
-        if (err) {
-          resolveResult({ ok: false, error: err.message });
-        } else {
-          resolveResult({ ok: true, message: `已在系统程序中打开：${basename(absPath)}` });
-        }
-      });
+      const child = spawn('xdg-open', [absPath], { detached: true, stdio: 'ignore' });
+      child.unref();
     }
-  });
+    return { ok: true, message: `已在系统默认程序中打开：${basename(absPath)}` };
+  } catch (err) {
+    console.error('[open-default] Failed:', err);
+    return { ok: false, error: err.message };
+  }
 });
 
 // POST /api/action/reveal { path }
@@ -327,27 +319,27 @@ app.api('/api/action/reveal', (data) => {
   }
 
   const absPath = resolve(targetPath);
+  const currentPlatform = platform();
 
-  return new Promise((resolveResult) => {
-    const currentPlatform = platform();
+  try {
     if (currentPlatform === 'win32') {
-      exec(`explorer.exe /select,"${absPath.replace(/"/g, '\\"')}"`, () => {
-        resolveResult({ ok: true, message: `已在资源管理器中高亮定位：${basename(absPath)}` });
+      const child = spawn('explorer.exe', [`/select,${absPath}`], {
+        detached: true,
+        stdio: 'ignore',
       });
+      child.unref();
     } else if (currentPlatform === 'darwin') {
-      execFile('open', ['-R', absPath], (err) => {
-        if (err) {
-          resolveResult({ ok: false, error: err.message });
-        } else {
-          resolveResult({ ok: true, message: `已在访达 (Finder) 中显示` });
-        }
-      });
+      const child = spawn('open', ['-R', absPath], { detached: true, stdio: 'ignore' });
+      child.unref();
     } else {
-      execFile('xdg-open', [dirname(absPath)], () => {
-        resolveResult({ ok: true, message: `已在文件管理器中打开` });
-      });
+      const child = spawn('xdg-open', [dirname(absPath)], { detached: true, stdio: 'ignore' });
+      child.unref();
     }
-  });
+    return { ok: true, message: `已在资源管理器中高亮定位：${basename(absPath)}` };
+  } catch (err) {
+    console.error('[reveal] Failed:', err);
+    return { ok: false, error: err.message };
+  }
 });
 
 // POST /api/action/copy-clipboard { text }
