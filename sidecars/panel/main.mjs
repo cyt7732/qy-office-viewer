@@ -19,13 +19,27 @@ const app = new SidecarApp();
 const readLocal = (name) => readFileSync(join(HERE, name), 'utf8');
 
 // ---------------------------------------------------------------------------
-// Static Routes
+// Static Routes (Strict No-Cache for Instant Hot Reloading)
 // ---------------------------------------------------------------------------
-app.page('/', () => readLocal('index.html'));
-app.page('/app.js', () => readLocal('app.js'));
+app.page('/', () =>
+  new Response(readLocal('index.html'), {
+    contentType: 'text/html; charset=utf-8',
+    headers: { 'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache' },
+  })
+);
+
+app.api('/app.js', () =>
+  new Response(readLocal('app.js'), {
+    contentType: 'application/javascript',
+    headers: { 'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache' },
+  }),
+'GET');
 
 app.api('/styles.css', () =>
-  new Response(readLocal('styles.css'), { contentType: 'text/css' }),
+  new Response(readLocal('styles.css'), {
+    contentType: 'text/css',
+    headers: { 'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache' },
+  }),
 'GET');
 
 // Vendor bundles

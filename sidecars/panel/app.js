@@ -11,6 +11,7 @@ let currentFile = null;
 let sniffedFiles = [];
 let currentZoom = 100;
 let isAutoFit = true;
+let currentDocNaturalWidth = 816;
 let currentWorkbook = null;
 let activeSheetName = null;
 let toastTimer = null;
@@ -270,7 +271,7 @@ function updateMetaDisplay(file) {
 // Render Engines
 // ---------------------------------------------------------------------------
 
-// 1. DOCX Renderer (docx-preview with proper inWrapper & Auto-Fit)
+// 1. DOCX Renderer (docx-preview with proper inWrapper & Horizontal Full-Width Fit)
 async function renderDocx(filePath) {
   const res = await sidecar.fetch(`/api/file/raw?path=${encodeURIComponent(filePath)}`);
   if (!res.ok) throw new Error('无法读取文件内容');
@@ -284,11 +285,11 @@ async function renderDocx(filePath) {
   container.innerHTML = '';
 
   if (window.docx && window.docx.renderAsync) {
-    // Crucial: inWrapper: true guarantees each page is an independent white paper sheet
+    // 关键：ignoreHeight: true 保证页面高度随正文段落自然伸展，杜绝半截白底和后续文字掉落
     await window.docx.renderAsync(arrayBuffer, container, null, {
       inWrapper: true,
       ignoreWidth: false,
-      ignoreHeight: false,
+      ignoreHeight: true,
       renderHeaders: true,
       renderFooters: true,
       renderFootnotes: true,
@@ -296,7 +297,15 @@ async function renderDocx(filePath) {
       useBase64URL: true,
     });
 
-    // Automatically fit to window width by default
+    // 测量未缩放状态下的自然物理宽度
+    const section = container.querySelector('section.docx');
+    if (section) {
+      currentDocNaturalWidth = section.offsetWidth || 816;
+    } else {
+      currentDocNaturalWidth = 816;
+    }
+
+    // 默认开启横向排满
     isAutoFit = true;
     requestAnimationFrame(() => {
       fitDocxToWidth();
@@ -306,33 +315,49 @@ async function renderDocx(filePath) {
   }
 }
 
-// Fit docx to viewport width
+// Fit docx to viewport width (严格按横向排满设置比例)
 function fitDocxToWidth() {
   const container = $('docx-render-target');
   const section = container.querySelector('section.docx');
   const viewport = $('viewport-container');
   if (!section || !viewport) return;
 
-  const docWidth = section.offsetWidth || 816;
-  const availableWidth = viewport.clientWidth - 28;
+  const innerWrapper = container.querySelector('.docx-wrapper') || container;
 
-  if (docWidth > 0 && availableWidth > 0) {
-    const scale = Math.min(1.0, Math.max(0.25, availableWidth / docWidth));
+  // 获得文档未缩放时的自然宽度
+  if (!currentDocNaturalWidth || currentDocNaturalWidth <= 0) {
+    const prevZoom = innerWrapper.style.zoom;
+    innerWrapper.style.zoom = '1';
+    currentDocNaturalWidth = section.offsetWidth || 816;
+    if (prevZoom) innerWrapper.style.zoom = prevZoom;
+  }
+
+  // viewport.clientWidth 扣除纵向滚动条后的纯可用宽度
+  const availableWidth = viewport.clientWidth;
+
+  if (docWidthAvailable(availableWidth, currentDocNaturalWidth)) {
+    const scale = availableWidth / currentDocNaturalWidth;
     applyDocxZoom(scale);
     isAutoFit = true;
   }
+}
+
+function docWidthAvailable(w, nat) {
+  return w > 0 && nat > 0;
 }
 
 function applyDocxZoom(scale) {
   currentZoom = Math.round(scale * 100);
   $('zoom-label').textContent = `${currentZoom}%`;
 
-  const target = $('docx-render-target');
-  if ('zoom' in target.style) {
-    target.style.zoom = scale;
+  const container = $('docx-render-target');
+  const innerWrapper = container.querySelector('.docx-wrapper') || container;
+
+  if ('zoom' in innerWrapper.style) {
+    innerWrapper.style.zoom = scale;
   } else {
-    target.style.transform = `scale(${scale})`;
-    target.style.transformOrigin = 'top center';
+    innerWrapper.style.transform = `scale(${scale})`;
+    innerWrapper.style.transformOrigin = 'top center';
   }
 }
 
@@ -438,7 +463,7 @@ function showLoading(msg) {
 // ---------------------------------------------------------------------------
 function updateZoom(newPercent) {
   isAutoFit = false;
-  const scale = Math.max(0.25, Math.min(2.0, newPercent / 100));
+  const scale = Math.max(0.2, Math.min(3.0, newPercent / 100));
   applyDocxZoom(scale);
 }
 
@@ -575,7 +600,15 @@ async function renderRawDroppedFile(file) {
       $('docx-wrapper').style.display = 'flex';
       $('zoom-controls').style.display = 'flex';
       $('docx-render-target').innerHTML = '';
-      await window.docx.renderAsync(arrayBuffer, $('docx-render-target'), null, { inWrapper: true });
+      await window.docx.renderAsync(arrayBuffer, $('docx-render-target'), null, {
+        inWrapper: true,
+        ignoreWidth: false,
+        ignoreHeight: true,
+        renderHeaders: true,
+        renderFooters: true,
+      });
+      const sec = $('docx-render-target').querySelector('section.docx');
+      currentDocNaturalWidth = sec ? (sec.offsetWidth || 816) : 816;
       isAutoFit = true;
       requestAnimationFrame(() => fitDocxToWidth());
     } else if (ext === '.xlsx' || ext === '.xls' || ext === '.csv') {
@@ -635,11 +668,23 @@ function initEvents() {
     if (e.key === 'Enter') $('btn-load-manual').click();
   });
 
+  // UI Hot Reload button
+  const reloadUiBtn = $('btn-reload-ui');
+  if (reloadUiBtn) {
+    reloadUiBtn.addEventListener('click', () => {
+      window.location.reload(true);
+    });
+  }
+
   // Zoom controls
   $('btn-zoom-in').addEventListener('click', () => updateZoom(currentZoom + 10));
   $('btn-zoom-out').addEventListener('click', () => updateZoom(currentZoom - 10));
   $('btn-zoom-reset').addEventListener('click', resetZoom);
-  $('btn-zoom-fit').addEventListener('click', fitDocxToWidth);
+  $('btn-zoom-fit').addEventListener('click', () => {
+    isAutoFit = true;
+    fitDocxToWidth();
+    toast('已调整为横向排满视口', 'info');
+  });
 
   setupDragAndDrop();
 
