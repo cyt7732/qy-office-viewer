@@ -1,6 +1,7 @@
 // QY Office Viewer Backend
 // Sidecar Node.js Service for Antigravity 2.22.0+
 
+import { createContext, runInContext } from 'node:vm';
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir, platform, release } from 'node:os';
 import { basename, dirname, extname, join, resolve } from 'node:path';
@@ -52,7 +53,25 @@ app.api('/vendor/jszip.min.js', () =>
 'GET');
 
 app.api('/vendor/xlsx.mini.min.js', () =>
-  new Response(readLocal('vendor/xlsx.mini.min.js'), { contentType: 'application/javascript' }),
+  new Response(readLocal('vendor/xlsx.full.min.js'), { contentType: 'application/javascript' }),
+'GET');
+
+app.api('/vendor/xlsx.full.min.js', () =>
+  new Response(readLocal('vendor/xlsx.full.min.js'), { contentType: 'application/javascript' }),
+'GET');
+
+app.api('/vendor/pdf.min.js', () =>
+  new Response(readLocal('vendor/pdf.min.js'), {
+    contentType: 'application/javascript; charset=utf-8',
+    headers: { 'Cache-Control': 'public, max-age=3600' },
+  }),
+'GET');
+
+app.api('/vendor/pdf.worker.min.js', () =>
+  new Response(readLocal('vendor/pdf.worker.min.js'), {
+    contentType: 'application/javascript; charset=utf-8',
+    headers: { 'Cache-Control': 'public, max-age=3600' },
+  }),
 'GET');
 
 // ---------------------------------------------------------------------------
@@ -60,7 +79,7 @@ app.api('/vendor/xlsx.mini.min.js', () =>
 // ---------------------------------------------------------------------------
 app.api('/api/status', () => ({
   name: 'qy-office-viewer',
-  version: '1.0.0',
+  version: '1.1.0',
   node: process.version,
   platform: `${platform()} ${release()}`,
   uptimeSeconds: Math.round((Date.now() - STARTED_AT) / 1000),
@@ -105,6 +124,69 @@ function safeStat(filePath) {
     return null;
   }
 }
+
+function resolveActualPath(inputPath) {
+  if (!inputPath || typeof inputPath !== 'string') return null;
+  const targetPath = inputPath.trim().replace(/^["']|["']$/g, '');
+  if (existsSync(targetPath)) return targetPath;
+
+  try {
+    const dir = dirname(targetPath);
+    if (!existsSync(dir)) return null;
+
+    const targetBase = basename(targetPath);
+    const targetExt = extname(targetBase).toLowerCase();
+    const targetStem = basename(targetBase, extname(targetBase)).toLowerCase();
+
+    const entries = readdirSync(dir, { withFileTypes: true });
+    const candidates = [];
+
+    for (const ent of entries) {
+      if (!ent.isFile()) continue;
+      const fName = ent.name;
+      const fExt = extname(fName).toLowerCase();
+      if (fExt !== targetExt) continue;
+
+      const fStem = basename(fName, extname(fName)).toLowerCase();
+      if (fStem === targetStem) {
+        return join(dir, fName);
+      }
+
+      const cleanTarget = targetStem.replace(/[\s_\-\(\)（）【】\[\]]/g, '');
+      const cleanCandidate = fStem.replace(/[\s_\-\(\)（）【】\[\]]/g, '');
+
+      let matches = 0;
+      const candidateChars = Array.from(cleanCandidate);
+      for (const ch of Array.from(cleanTarget)) {
+        const idx = candidateChars.indexOf(ch);
+        if (idx !== -1) {
+          matches++;
+          candidateChars.splice(idx, 1);
+        }
+      }
+      const similarity = (2 * matches) / (cleanTarget.length + cleanCandidate.length);
+      candidates.push({ name: fName, path: join(dir, fName), similarity });
+    }
+
+    if (candidates.length === 1 && candidates[0].similarity >= 0.5) {
+      console.log(`[resolveActualPath] 唯一候选文件智能对齐: "${targetBase}" -> "${candidates[0].name}" (相似度: ${(candidates[0].similarity * 100).toFixed(1)}%)`);
+      return candidates[0].path;
+    }
+
+    if (candidates.length > 1) {
+      candidates.sort((a, b) => b.similarity - a.similarity);
+      if (candidates[0].similarity >= 0.75) {
+        console.log(`[resolveActualPath] 高相似度候选文件智能对齐: "${targetBase}" -> "${candidates[0].name}" (相似度: ${(candidates[0].similarity * 100).toFixed(1)}%)`);
+        return candidates[0].path;
+      }
+    }
+  } catch (err) {
+    console.warn('[resolveActualPath] Notice:', err.message);
+  }
+
+  return null;
+}
+
 
 function scanDirForFiles(dirPath, maxDepth = 2, currentDepth = 0, ignoreDirs = new Set(['.git', 'node_modules', '.venv', 'dist', 'build', '.data', '.system_generated', '.user_uploaded', 'scratch'])) {
   if (currentDepth > maxDepth || !existsSync(dirPath)) return [];
@@ -226,26 +308,28 @@ const MIME_TYPES = {
 
 // GET /api/file/raw?path=...
 app.api('/api/file/raw', (data) => {
-  const targetPath = data.path;
-  if (!targetPath || !existsSync(targetPath)) {
-    return new Response(JSON.stringify({ error: 'File not found' }), {
+  const actualPath = resolveActualPath(data.path);
+  if (!actualPath) {
+    return new Response(JSON.stringify({ error: '文件不存在或路径无效' }), {
       status: 404,
       contentType: 'application/json',
     });
   }
 
-  const ext = extname(targetPath).toLowerCase();
+  const ext = extname(actualPath).toLowerCase();
   const contentType = MIME_TYPES[ext] || 'application/octet-stream';
 
   try {
-    const buffer = readFileSync(targetPath);
+    const buffer = readFileSync(actualPath);
     // Record to recent history
-    addRecentFile(targetPath);
+    addRecentFile(actualPath);
     return new Response(buffer, {
       contentType,
       headers: {
-        'Content-Disposition': `inline; filename="${encodeURIComponent(basename(targetPath))}"`,
-        'Cache-Control': 'no-cache',
+        'Content-Disposition': `inline; filename="${encodeURIComponent(basename(actualPath))}"`,
+        'Cache-Control': 'no-store, no-cache, must-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0',
       },
     });
   } catch (err) {
@@ -258,20 +342,73 @@ app.api('/api/file/raw', (data) => {
 
 // GET /api/file/meta?path=...
 app.api('/api/file/meta', (data) => {
-  const targetPath = data.path;
-  if (!targetPath || !existsSync(targetPath)) {
-    return { error: 'File not found' };
+  const actualPath = resolveActualPath(data.path);
+  if (!actualPath) {
+    return { error: '文件不存在或路径无效' };
   }
-  const st = safeStat(targetPath);
-  const ext = extname(targetPath).toLowerCase();
+  const st = safeStat(actualPath);
+  const ext = extname(actualPath).toLowerCase();
   return {
-    name: basename(targetPath),
-    path: targetPath,
+    name: basename(actualPath),
+    path: actualPath,
+    originalPath: data.path,
+    resolved: actualPath !== data.path,
     size: st?.size ?? 0,
     mtime: st?.mtime ?? 0,
     ext,
     type: getFileType(ext),
   };
+}, 'GET');
+
+// Server-side Spreadsheet Parser (100% CJK & CP936 Encoding Lossless Guarantee)
+let cachedXLSX = null;
+function getBackendXLSX() {
+  if (!cachedXLSX) {
+    const sandbox = { window: {}, Uint8Array, ArrayBuffer, Buffer, console };
+    createContext(sandbox);
+    const code = readFileSync(join(HERE, 'vendor/xlsx.full.min.js'), 'utf8');
+    runInContext(code, sandbox);
+    cachedXLSX = sandbox.window.XLSX || sandbox.XLSX;
+  }
+  return cachedXLSX;
+}
+
+// GET /api/file/spreadsheet?path=...
+app.api('/api/file/spreadsheet', (data) => {
+  const actualPath = resolveActualPath(data.path);
+  if (!actualPath) {
+    return { ok: false, error: '文件不存在或路径无效' };
+  }
+
+  try {
+    const xlsxLib = getBackendXLSX();
+    const buf = readFileSync(actualPath);
+    const wb = xlsxLib.read(buf, { type: 'buffer' });
+    const sheetNames = wb.SheetNames || [];
+    const sheets = {};
+
+    for (const name of sheetNames) {
+      const ws = wb.Sheets[name];
+      if (ws) {
+        sheets[name] = xlsxLib.utils.sheet_to_html(ws, {
+          header: '',
+          footer: '',
+          id: 'sheet-table',
+          editable: false,
+        });
+      }
+    }
+
+    addRecentFile(actualPath);
+    return {
+      ok: true,
+      sheetNames,
+      sheets,
+    };
+  } catch (err) {
+    console.error('[spreadsheet] Backend parse error:', err);
+    return { ok: false, error: err.message };
+  }
 }, 'GET');
 
 // ---------------------------------------------------------------------------
@@ -280,12 +417,12 @@ app.api('/api/file/meta', (data) => {
 
 // POST /api/action/open-default { path }
 app.api('/api/action/open-default', (data) => {
-  const targetPath = data.path;
-  if (!targetPath || !existsSync(targetPath)) {
+  const actualPath = resolveActualPath(data.path);
+  if (!actualPath) {
     return { ok: false, error: '文件不存在或路径无效' };
   }
 
-  const absPath = resolve(targetPath);
+  const absPath = resolve(actualPath);
   addRecentFile(absPath);
 
   const currentPlatform = platform();
@@ -313,12 +450,12 @@ app.api('/api/action/open-default', (data) => {
 
 // POST /api/action/reveal { path }
 app.api('/api/action/reveal', (data) => {
-  const targetPath = data.path;
-  if (!targetPath || !existsSync(targetPath)) {
+  const actualPath = resolveActualPath(data.path);
+  if (!actualPath) {
     return { ok: false, error: '文件不存在或路径无效' };
   }
 
-  const absPath = resolve(targetPath);
+  const absPath = resolve(actualPath);
   const currentPlatform = platform();
 
   try {

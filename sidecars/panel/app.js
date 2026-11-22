@@ -12,10 +12,22 @@ let sniffedFiles = [];
 let currentZoom = 100;
 let isAutoFit = true;
 let currentDocNaturalWidth = 816;
+let currentPdfDoc = null;
+let currentPdfNaturalWidth = 595;
 let currentWorkbook = null;
 let activeSheetName = null;
 let toastTimer = null;
+
+// URL & Query Routing State
+let lastKnownSearch = '';
 let lastKnownQueryFile = null;
+let lastKnownQueryTimestamp = null;
+
+// Smart On-Demand Interaction & Dynamic Heartbeat State
+let isCheckingModification = false;
+let lastCheckTime = 0;
+let lastActivityTime = Date.now();
+let heartbeatTimer = null;
 
 // ---------------------------------------------------------------------------
 // Helpers & Toasts
@@ -58,13 +70,19 @@ async function callApi(path, { method = 'GET', body } = {}) {
   return data;
 }
 
-function getUrlFileParam() {
+function getUrlParams() {
   try {
     const params = new URLSearchParams(window.location.search);
-    return params.get('file') || params.get('path') || null;
+    const file = params.get('file') || params.get('path') || null;
+    const timestamp = params.get('_t') || params.get('t') || null;
+    return { file, timestamp };
   } catch {
-    return null;
+    return { file: null, timestamp: null };
   }
+}
+
+function getUrlFileParam() {
+  return getUrlParams().file;
 }
 
 function normPath(p) {
@@ -72,139 +90,160 @@ function normPath(p) {
 }
 
 // ---------------------------------------------------------------------------
-// Sniffer & File Discovery
+// Host Theme Synchronization & Preservation
 // ---------------------------------------------------------------------------
-async function refreshFiles(preferPath = null) {
+function syncAndPreserveTheme() {
   try {
-    let workspaceUris = [];
-    if (sidecar.getWorkspaceUris) {
-      workspaceUris = await sidecar.getWorkspaceUris().catch(() => []);
+    const rootStyle = getComputedStyle(document.documentElement);
+    const primaryVal = rootStyle.getPropertyValue('--primary').trim();
+    const bgVal = rootStyle.getPropertyValue('--background').trim();
+
+    if (primaryVal && primaryVal !== '#2563eb') {
+      localStorage.setItem('qy_theme_primary', primaryVal);
+      if (bgVal) localStorage.setItem('qy_theme_bg', bgVal);
+    } else {
+      const savedPrimary = localStorage.getItem('qy_theme_primary');
+      const savedBg = localStorage.getItem('qy_theme_bg');
+      if (savedPrimary) {
+        document.documentElement.style.setProperty('--primary', savedPrimary);
+        document.documentElement.style.setProperty('--primary-color', savedPrimary);
+      }
+      if (savedBg) {
+        document.documentElement.style.setProperty('--background', savedBg);
+        document.documentElement.style.setProperty('--bg-color', savedBg);
+      }
     }
-
-    const conversationId = sidecar.conversationId || '';
-    const params = new URLSearchParams();
-    if (conversationId) params.set('conversationId', conversationId);
-    if (workspaceUris.length > 0) params.set('workspaces', JSON.stringify(workspaceUris));
-
-    const res = await callApi(`/api/files/sniff?${params.toString()}`);
-    const newFiles = res.files || [];
-    sniffedFiles = newFiles;
-
-    const urlFile = getUrlFileParam();
-    const effectivePrefer = preferPath || urlFile;
-
-    renderFileDropdown(effectivePrefer);
-    $('header-status').textContent = `已发现 ${sniffedFiles.length} 个文档`;
-  } catch (err) {
-    console.error('[sniff] Error:', err);
-    $('header-status').textContent = '嗅探出错';
-  }
+  } catch {}
 }
 
-function renderFileDropdown(preferPath = null) {
-  const select = $('file-select');
-  select.innerHTML = '';
+// ---------------------------------------------------------------------------
+// Document Route & Synchronizer (Always Fresh & Dynamic Auto-Watcher)
+// ---------------------------------------------------------------------------
+async function syncWithUrl(force = false) {
+  const { file: urlFile, timestamp: urlTimestamp } = getUrlParams();
+  lastKnownSearch = window.location.search || '';
+  lastKnownQueryFile = urlFile;
+  lastKnownQueryTimestamp = urlTimestamp;
 
-  if (sniffedFiles.length === 0) {
-    const opt = document.createElement('option');
-    opt.value = '';
-    opt.textContent = '暂未嗅探到 Office 文档';
-    select.appendChild(opt);
-    updateButtonsState(null);
-    showEmptyState('未发现任何 Office 文档，请在上方手动输入路径或拖入文件');
+  if (!urlFile) {
+    if (!currentFile) {
+      showEmptyState('未指定预览文档，请在对话中点击文档胶囊打开');
+      updateButtonsState(null);
+      updateMetaDisplay(null);
+      $('header-status').textContent = '就绪';
+    }
     return;
   }
 
-  const groups = {
-    conversation: { label: '💬 当前会话工件', items: [] },
-    workspace: { label: '📁 当前工作区文档', items: [] },
-    recent: { label: '🕒 最近打开历史', items: [] },
+  const isSameFile = currentFile && normPath(currentFile.path) === normPath(urlFile);
+
+  let meta = null;
+  try {
+    meta = await callApi(`/api/file/meta?path=${encodeURIComponent(urlFile)}&_t=${Date.now()}`);
+  } catch (err) {
+    console.warn('[syncWithUrl] Meta query notice:', err);
+  }
+
+  // 同一文件若非强制刷新，检查磁盘时间戳与文件大小是否变化
+  if (isSameFile && !force) {
+    if (meta && currentFile.mtime && meta.mtime === currentFile.mtime && meta.size === currentFile.size) {
+      return; // 磁盘无改动，保持当前视图
+    }
+  }
+
+  const effectivePath = meta?.path || urlFile;
+  const name = meta?.name || effectivePath.split(/[\/\\]/).pop();
+  const ext = meta?.ext || ('.' + name.split('.').pop().toLowerCase());
+  let fileInfo = {
+    name,
+    path: effectivePath,
+    originalRequestedPath: urlFile,
+    ext,
+    size: meta?.size || 0,
+    mtime: meta?.mtime || Date.now(),
   };
 
-  for (const f of sniffedFiles) {
-    const grp = groups[f.source] || groups.workspace;
-    grp.items.push(f);
-  }
+  notifyUserActivity(false);
+  await loadFile(fileInfo);
+}
 
-  let targetToSelect = null;
-
-  // 1. Explicit path from URL or parameter
-  if (preferPath) {
-    const normPrefer = normPath(preferPath);
-    targetToSelect = sniffedFiles.find((f) => normPath(f.path) === normPrefer);
-    if (!targetToSelect) {
-      const name = preferPath.split(/[\/\\]/).pop();
-      const ext = '.' + name.split('.').pop().toLowerCase();
-      targetToSelect = {
-        name,
-        path: preferPath,
-        ext,
-        size: 0,
-        mtime: Date.now(),
-        source: 'direct',
-      };
-      sniffedFiles.unshift(targetToSelect);
+// 重新加载当前正在查看的文档
+async function reloadCurrentDocument(showToastNotice = true) {
+  if (!currentFile || !currentFile.path) return;
+  try {
+    const meta = await callApi(`/api/file/meta?path=${encodeURIComponent(currentFile.path)}&_t=${Date.now()}`);
+    if (meta && !meta.error) {
+      currentFile.size = meta.size;
+      currentFile.mtime = meta.mtime;
     }
+  } catch (err) {
+    console.warn('[reloadCurrentDocument] meta fetch notice:', err);
   }
+  await loadFile(currentFile);
+  if (showToastNotice) {
+    toast(`已重新载入最新文档`, 'success');
+  }
+}
 
-  // 2. Default selection: auto-switch to newest file
-  if (!targetToSelect) {
-    const newestFile = sniffedFiles[0];
-    if (!currentFile) {
-      targetToSelect = newestFile;
-    } else {
-      const currentStillExists = sniffedFiles.some((f) => normPath(f.path) === normPath(currentFile.path));
-      if (newestFile && newestFile.mtime > (currentFile.mtime || 0) + 1500) {
-        targetToSelect = newestFile;
-      } else if (currentStillExists) {
-        targetToSelect = sniffedFiles.find((f) => normPath(f.path) === normPath(currentFile.path));
-      } else {
-        targetToSelect = newestFile;
+// ---------------------------------------------------------------------------
+// Smart On-Demand Modification Checker & Adaptive Heartbeat
+// ---------------------------------------------------------------------------
+function notifyUserActivity(doCheckImmediately = true) {
+  lastActivityTime = Date.now();
+  if (doCheckImmediately) {
+    checkAndReloadIfModified();
+  }
+}
+
+async function checkAndReloadIfModified(force = false) {
+  if (!currentFile || !currentFile.path) return;
+  const now = Date.now();
+  if (!force && now - lastCheckTime < 600) return; // 节流 600ms
+  if (isCheckingModification) return;
+
+  lastCheckTime = now;
+  isCheckingModification = true;
+
+  try {
+    const meta = await callApi(`/api/file/meta?path=${encodeURIComponent(currentFile.path)}&_t=${now}`);
+    if (meta && !meta.error) {
+      const isMtimeChanged = currentFile.mtime && meta.mtime && meta.mtime !== currentFile.mtime;
+      const isSizeChanged = currentFile.size !== undefined && meta.size !== undefined && meta.size !== currentFile.size;
+
+      if (isMtimeChanged || isSizeChanged) {
+        console.log('[Auto-Reload] 物理文件已更新，自动热重载最新文档:', meta);
+        currentFile.size = meta.size;
+        currentFile.mtime = meta.mtime;
+        await loadFile(currentFile);
+        toast('文档已更新，已自动载入最新内容', 'success');
       }
     }
-  }
-
-  // Build optgroups
-  for (const [key, grp] of Object.entries(groups)) {
-    if (grp.items.length === 0) continue;
-    const optgroup = document.createElement('optgroup');
-    optgroup.label = grp.label;
-    for (const f of grp.items) {
-      const opt = document.createElement('option');
-      opt.value = f.path;
-      const icon = getFileIcon(f.ext);
-      opt.textContent = `${icon} ${f.name} (${formatBytes(f.size)})`;
-      optgroup.appendChild(opt);
-    }
-    select.appendChild(optgroup);
-  }
-
-  if (targetToSelect) {
-    select.value = targetToSelect.path;
-    if (!currentFile || normPath(currentFile.path) !== normPath(targetToSelect.path)) {
-      loadFile(targetToSelect);
-    }
+  } catch (err) {
+    // 忽略静默探测失败
+  } finally {
+    isCheckingModification = false;
   }
 }
 
-function getFileIcon(ext) {
-  switch ((ext || '').toLowerCase()) {
-    case '.docx':
-    case '.doc':
-      return '📄';
-    case '.xlsx':
-    case '.xls':
-    case '.csv':
-      return '📊';
-    case '.pdf':
-      return '📕';
-    case '.pptx':
-    case '.ppt':
-      return '📑';
-    default:
-      return '📝';
-  }
+// 自适应动态心跳：
+// 1. 文档刚打开或用户刚操作后的前 25 秒（修改高发期）：每 2.5 秒轻量探测一次
+// 2. 25-90 秒（阅读平稳期）：降频至约每 8 秒探测一次
+// 3. 超过 90 秒无操作（静置期）：彻底休眠（0 次网络/IO 请求），完全依靠用户鼠标划入或胶囊点击唤醒
+function startAdaptiveHeartbeat() {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = setInterval(() => {
+    if (!currentFile || !currentFile.path) return;
+    const idleSeconds = (Date.now() - lastActivityTime) / 1000;
+    if (idleSeconds <= 25) {
+      checkAndReloadIfModified();
+    } else if (idleSeconds <= 90) {
+      if (Math.floor(idleSeconds) % 8 < 3) {
+        checkAndReloadIfModified();
+      }
+    }
+  }, 2500);
 }
+
 
 // ---------------------------------------------------------------------------
 // Load and Render File
@@ -215,16 +254,21 @@ async function loadFile(fileInfo) {
   updateButtonsState(fileInfo);
   updateMetaDisplay(fileInfo);
 
-  showLoading(`正在载入 ${fileInfo.name}...`);
-
   const ext = (fileInfo.ext || '').toLowerCase();
+  let typeLabel = 'Office 预览';
+  if (ext === '.docx' || ext === '.doc') typeLabel = 'Word 文档';
+  else if (ext === '.xlsx' || ext === '.xls' || ext === '.csv') typeLabel = 'Excel 表格';
+  else if (ext === '.pdf') typeLabel = 'PDF 文档';
+  $('header-status').textContent = typeLabel;
+
+  showLoading(`正在载入 ${fileInfo.name}...`);
   try {
     if (ext === '.docx') {
       await renderDocx(fileInfo.path);
     } else if (ext === '.xlsx' || ext === '.xls' || ext === '.csv') {
       await renderSpreadsheet(fileInfo.path, ext);
     } else if (ext === '.pdf') {
-      renderPdf(fileInfo.path);
+      await renderPdf(fileInfo.path);
     } else {
       showEmptyState(`暂不支持在侧边栏直接预览 ${ext} 文件，请使用顶部按钮在本地默认程序中打开。`);
     }
@@ -243,13 +287,17 @@ function updateButtonsState(file) {
 
   if (file) {
     const ext = (file.ext || '').toLowerCase();
-    let label = '在系统默认程序中打开';
-    if (ext === '.docx' || ext === '.doc') label = '在 Word / WPS 中打开';
-    else if (ext === '.xlsx' || ext === '.xls' || ext === '.csv') label = '在 Excel / WPS 表格中打开';
-    else if (ext === '.pdf') label = '在 PDF 阅读器中打开';
+    let label = '打开';
+    if (ext === '.docx' || ext === '.doc') label = 'Word 打开';
+    else if (ext === '.xlsx' || ext === '.xls' || ext === '.csv') label = 'Excel 打开';
+    else if (ext === '.pdf') label = 'PDF 打开';
     $('btn-open-label').textContent = label;
+    $('btn-open-default').title = `在系统默认程序中打开：${file.name}`;
+    $('btn-reveal').title = `在资源管理器中定位：${file.name}`;
+    $('btn-copy-path').title = `复制绝对路径：${file.path}`;
   } else {
-    $('btn-open-label').textContent = '在系统默认程序中打开';
+    $('btn-open-label').textContent = '打开';
+    $('btn-open-default').title = '在系统默认程序中打开';
   }
 }
 
@@ -272,8 +320,15 @@ function updateMetaDisplay(file) {
 
 // 1. DOCX Renderer (docx-preview with proper inWrapper & Horizontal Full-Width Fit)
 async function renderDocx(filePath) {
-  const res = await sidecar.fetch(`/api/file/raw?path=${encodeURIComponent(filePath)}`);
-  if (!res.ok) throw new Error('无法读取文件内容');
+  const res = await sidecar.fetch(`/api/file/raw?path=${encodeURIComponent(filePath)}&_t=${Date.now()}`);
+  if (!res.ok) {
+    let errMsg = '无法读取文件内容 (文件可能不存在或无法访问)';
+    try {
+      const errJson = await res.json();
+      if (errJson && errJson.error) errMsg = errJson.error;
+    } catch {}
+    throw new Error(errMsg);
+  }
   const arrayBuffer = await res.arrayBuffer();
 
   hideAllViewports();
@@ -294,7 +349,11 @@ async function renderDocx(filePath) {
       renderFootnotes: true,
       renderEndnotes: true,
       useBase64URL: true,
+      experimental: true,
     });
+
+    // 智能修正国标公文落款缩进与中心对齐（GB/T 9704-2012）
+    fixDocxSignatures(container);
 
     // 测量未缩放状态下的自然物理宽度
     const section = container.querySelector('section.docx');
@@ -307,13 +366,149 @@ async function renderDocx(filePath) {
     // 默认开启横向排满，多层渲染帧兜底保证视口宽度测量 100% 准确
     isAutoFit = true;
     requestAnimationFrame(() => {
+      fixDocxSignatures(container);
       fitDocxToWidth();
       setTimeout(() => {
+        fixDocxSignatures(container);
         if (isAutoFit) fitDocxToWidth();
       }, 100);
     });
   } else {
     throw new Error('docx-preview 引擎未就绪');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Standard Government Signature Post-Processor (GB/T 9704-2012 Compliance)
+// ---------------------------------------------------------------------------
+function fixDocxSignatures(container) {
+  if (!container) return;
+  const paragraphs = Array.from(container.querySelectorAll('section.docx p, .docx-wrapper p, p'));
+  if (paragraphs.length === 0) return;
+
+  // 正则：成文日期格式（支持阿拉伯数字、大写汉字、零/〇等全角半角）
+  const dateRegex = /^[〇一二三四五六七八九十零0-9]{4}\s*年\s*[一二三四五六七八九十0-9]{1,2}\s*月\s*[一二三四五六七八九十0-9]{1,2}\s*日$/;
+  // 机构/落款关键词常见结尾
+  const orgSuffixRegex = /(?:公司|党委|办公室|纪委|工会|委员会|支部|部门|部|处|科|局|组|团委|支公司|分公司|中心)$/;
+
+  for (let i = 0; i < paragraphs.length; i++) {
+    const p = paragraphs[i];
+    if (p.classList.contains('gov-signature-line')) continue;
+
+    const rawText = (p.innerText || p.textContent || '').trim();
+    const cleanText = rawText.replace(/[\s\t\u3000\u00a0]+/g, '');
+
+    if (dateRegex.test(cleanText)) {
+      // 找到了成文日期段落！向上回溯收集落款组（发文机关/部门署名）
+      const sigGroup = [p];
+      let j = i - 1;
+      while (j >= 0 && sigGroup.length < 5) {
+        const prevP = paragraphs[j];
+        if (prevP.classList.contains('gov-signature-line')) break;
+        const prevText = (prevP.innerText || prevP.textContent || '').trim();
+        const prevClean = prevText.replace(/[\s\t\u3000\u00a0]+/g, '');
+
+        if (!prevClean) {
+          j--;
+          continue;
+        }
+
+        // 遇到附件或标题或长正文，停止回溯
+        if (prevClean.startsWith('附件') || prevClean.includes('附件：') || prevClean.includes('附件:')) {
+          break;
+        }
+
+        const hasTab = prevText.includes('\t') || !!prevP.querySelector('.docx-tab-stop');
+        const isOrgLike = prevClean.length <= 35 && (orgSuffixRegex.test(prevClean) || hasTab);
+
+        if (isOrgLike || (hasTab && prevClean.length <= 40)) {
+          sigGroup.unshift(prevP);
+          j--;
+        } else {
+          break;
+        }
+      }
+
+      // 计算这一组落款中最长一行的视觉字符宽度（汉字算1，非汉字算0.55）
+      let maxVisualWidth = 0;
+      const groupData = sigGroup.map((sigP) => {
+        const text = (sigP.innerText || sigP.textContent || '').replace(/[\t\r\n]+/g, '').trim();
+        let w = 0;
+        for (const char of text) {
+          w += char.charCodeAt(0) > 255 ? 1 : 0.55;
+        }
+        if (w > maxVisualWidth) maxVisualWidth = w;
+        return { p: sigP, text, visualWidth: w };
+      });
+
+      if (maxVisualWidth >= 2) {
+        const targetWidthEm = Math.ceil(maxVisualWidth) + 0.5;
+        groupData.forEach(({ p: sigP, text }) => {
+          sigP.classList.add('gov-signature-line');
+          sigP.style.setProperty('text-align', 'right', 'important');
+          sigP.style.setProperty('padding-right', '4em', 'important'); // 国标GB/T 9704-2012：右空四字
+          sigP.style.setProperty('margin-left', '0', 'important');
+          sigP.style.setProperty('text-indent', '0', 'important');
+          sigP.style.setProperty('white-space', 'nowrap', 'important');
+
+          // 构建居中包裹容器
+          const block = document.createElement('span');
+          block.className = 'gov-signature-block';
+          block.style.setProperty('display', 'inline-block', 'important');
+          block.style.setProperty('min-width', `${targetWidthEm}em`, 'important');
+          block.style.setProperty('text-align', 'center', 'important');
+          block.style.setProperty('white-space', 'nowrap', 'important');
+
+          // 收集内部子节点，去除多余制表符与前导空白
+          const validNodes = [];
+          Array.from(sigP.childNodes).forEach((node) => {
+            if (node.nodeType === Node.ELEMENT_NODE) {
+              if (node.classList.contains('docx-tab-stop') || node.innerHTML === '&emsp;' || node.textContent === '\t') {
+                return;
+              }
+            } else if (node.nodeType === Node.TEXT_NODE) {
+              if (node.textContent.trim() === '') return;
+              node.textContent = node.textContent.replace(/^[\t\s]+/, '');
+            }
+            validNodes.push(node);
+          });
+
+          sigP.innerHTML = '';
+          if (validNodes.length > 0) {
+            validNodes.forEach((n) => block.appendChild(n));
+          } else {
+            block.textContent = text;
+          }
+          sigP.appendChild(block);
+        });
+      }
+    }
+  }
+
+  // 补充扫描：仅有发文机关而无日期的单独落款行（以较多空格/制表符开头且以常见机构结尾）
+  for (let i = 0; i < paragraphs.length; i++) {
+    const p = paragraphs[i];
+    if (p.classList.contains('gov-signature-line')) continue;
+    const raw = (p.innerText || p.textContent || '');
+    if ((/^[\t\s\u3000\u00a0]{4,}/.test(raw) || p.querySelector('.docx-tab-stop')) && raw.trim().length <= 30) {
+      const clean = raw.trim().replace(/[\s\t\u3000\u00a0]+/g, '');
+      if (orgSuffixRegex.test(clean)) {
+        p.classList.add('gov-signature-line');
+        p.style.setProperty('text-align', 'right', 'important');
+        p.style.setProperty('padding-right', '4em', 'important');
+        p.style.setProperty('margin-left', '0', 'important');
+        p.style.setProperty('text-indent', '0', 'important');
+        p.style.setProperty('white-space', 'nowrap', 'important');
+
+        const block = document.createElement('span');
+        block.className = 'gov-signature-block';
+        block.style.setProperty('display', 'inline-block', 'important');
+        block.style.setProperty('text-align', 'center', 'important');
+        block.textContent = raw.trim();
+        p.innerHTML = '';
+        p.appendChild(block);
+      }
+    }
   }
 }
 
@@ -363,73 +558,262 @@ function applyDocxZoom(scale) {
   }
 }
 
-// 2. Spreadsheet Renderer (SheetJS / XLSX)
+// 2. Spreadsheet Renderer (Backend Lossless CJK HTML Stream + Fallback)
+let currentSheetsMap = {};
+
 async function renderSpreadsheet(filePath, ext) {
-  const res = await sidecar.fetch(`/api/file/raw?path=${encodeURIComponent(filePath)}`);
-  if (!res.ok) throw new Error('无法读取表格内容');
-  const arrayBuffer = await res.arrayBuffer();
-
   hideAllViewports();
-  $('xlsx-wrapper').style.display = 'flex';
-  $('zoom-controls').style.display = 'none';
+  showLoading(`正在载入表格 ${currentFile ? currentFile.name : ''}...`);
 
-  if (!window.XLSX) {
-    throw new Error('XLSX 引擎未就绪');
-  }
+  try {
+    // 优先调用后端高保真无损解析 API（由 Node.js 服务端完成 CJK/CP936 解码，100% 杜绝浏览器 latin1 乱码）
+    const res = await callApi(`/api/file/spreadsheet?path=${encodeURIComponent(filePath)}&_t=${Date.now()}`);
+    if (!res || !res.ok) {
+      throw new Error((res && res.error) || '服务端解析表格失败');
+    }
 
-  const data = new Uint8Array(arrayBuffer);
-  currentWorkbook = window.XLSX.read(data, { type: 'array' });
-  const sheetNames = currentWorkbook.SheetNames || [];
+    hideAllViewports();
+    $('xlsx-wrapper').style.display = 'flex';
+    $('zoom-controls').style.display = 'none';
 
-  if (sheetNames.length === 0) {
-    $('xlsx-table-wrapper').innerHTML = '<div style="padding:20px;text-align:center;">工作簿为空</div>';
-    return;
-  }
+    const sheetNames = res.sheetNames || [];
+    if (sheetNames.length === 0) {
+      $('xlsx-table-wrapper').innerHTML = '<div style="padding:20px;text-align:center;">工作簿为空</div>';
+      return;
+    }
 
-  const tabsContainer = $('sheet-tabs');
-  tabsContainer.innerHTML = '';
-  sheetNames.forEach((name, idx) => {
-    const tab = document.createElement('div');
-    tab.className = `sheet-tab ${idx === 0 ? 'active' : ''}`;
-    tab.textContent = name;
-    tab.addEventListener('click', () => {
-      document.querySelectorAll('.sheet-tab').forEach((t) => t.classList.remove('active'));
-      tab.classList.add('active');
-      renderSheetTable(name);
+    currentSheetsMap = res.sheets || {};
+
+    const tabsContainer = $('sheet-tabs');
+    tabsContainer.innerHTML = '';
+    sheetNames.forEach((name, idx) => {
+      const tab = document.createElement('div');
+      tab.className = `sheet-tab ${idx === 0 ? 'active' : ''}`;
+      tab.textContent = name;
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.sheet-tab').forEach((t) => t.classList.remove('active'));
+        tab.classList.add('active');
+        renderSheetTable(name);
+      });
+      tabsContainer.appendChild(tab);
     });
-    tabsContainer.appendChild(tab);
-  });
 
-  renderSheetTable(sheetNames[0]);
+    renderSheetTable(sheetNames[0]);
+  } catch (backendErr) {
+    console.warn('[renderSpreadsheet] Backend parse failed, trying client fallback:', backendErr);
+    // 降级使用前端本地 SheetJS
+    try {
+      const rawRes = await sidecar.fetch(`/api/file/raw?path=${encodeURIComponent(filePath)}&_t=${Date.now()}`);
+      if (!rawRes.ok) throw new Error('无法读取表格原始数据');
+      const arrayBuffer = await rawRes.arrayBuffer();
+
+      hideAllViewports();
+      $('xlsx-wrapper').style.display = 'flex';
+      $('zoom-controls').style.display = 'none';
+
+      if (!window.XLSX) throw new Error('XLSX 引擎未就绪');
+      const data = new Uint8Array(arrayBuffer);
+      currentWorkbook = window.XLSX.read(data, { type: 'array' });
+      const sheetNames = currentWorkbook.SheetNames || [];
+      if (sheetNames.length === 0) {
+        $('xlsx-table-wrapper').innerHTML = '<div style="padding:20px;text-align:center;">工作簿为空</div>';
+        return;
+      }
+
+      currentSheetsMap = {};
+      for (const sname of sheetNames) {
+        currentSheetsMap[sname] = window.XLSX.utils.sheet_to_html(currentWorkbook.Sheets[sname], {
+          id: 'sheet-table',
+          editable: false,
+        });
+      }
+
+      const tabsContainer = $('sheet-tabs');
+      tabsContainer.innerHTML = '';
+      sheetNames.forEach((name, idx) => {
+        const tab = document.createElement('div');
+        tab.className = `sheet-tab ${idx === 0 ? 'active' : ''}`;
+        tab.textContent = name;
+        tab.addEventListener('click', () => {
+          document.querySelectorAll('.sheet-tab').forEach((t) => t.classList.remove('active'));
+          tab.classList.add('active');
+          renderSheetTable(name);
+        });
+        tabsContainer.appendChild(tab);
+      });
+
+      renderSheetTable(sheetNames[0]);
+    } catch (clientErr) {
+      console.error('[renderSpreadsheet] Fallback failed:', clientErr);
+      showEmptyState(`表格解析失败: ${backendErr.message}`);
+      toast(`表格解析失败: ${backendErr.message}`, 'error');
+    }
+  }
 }
 
 function renderSheetTable(sheetName) {
   activeSheetName = sheetName;
-  const worksheet = currentWorkbook.Sheets[sheetName];
-  if (!worksheet) return;
-
-  const html = window.XLSX.utils.sheet_to_html(worksheet, {
-    header: '',
-    footer: '',
-    id: 'sheet-table',
-    editable: false,
-  });
-
+  const html = currentSheetsMap[sheetName] || '';
   const tableContainer = $('xlsx-table-wrapper');
   tableContainer.innerHTML = html;
   const table = tableContainer.querySelector('table');
   if (table) {
     table.className = 'sheet-table';
+    table.querySelectorAll('td').forEach((td) => {
+      if (td.textContent.includes('\n') || td.textContent.length > 40) {
+        td.classList.add('multiline-cell');
+      }
+    });
   }
 }
 
-// 3. PDF Renderer
-function renderPdf(filePath) {
+// 3. PDF Renderer (Mozilla PDF.js Offline High-DPI Multi-Page Canvas Stream)
+async function ensurePdfEngine() {
+  if (window.pdfjsLib) return;
+  for (let i = 0; i < 6; i++) {
+    if (window.pdfjsLib) return;
+    await new Promise((r) => setTimeout(r, 60));
+  }
+  if (window.pdfjsLib) return;
+
+  try {
+    const r1 = await sidecar.fetch('/vendor/pdf.min.js').catch(() => null);
+    if (r1 && r1.ok) {
+      const scriptText = await r1.text();
+      const script = document.createElement('script');
+      script.textContent = scriptText;
+      document.head.appendChild(script);
+      await new Promise((r) => setTimeout(r, 80));
+    }
+  } catch (err) {
+    console.error('[PDF.js] Dynamic engine load error:', err);
+  }
+
+  if (!window.pdfjsLib) {
+    throw new Error('PDF 离线引擎 (pdf.min.js) 尚未完成加载');
+  }
+}
+
+async function ensurePdfWorker() {
+  if (!window.pdfjsLib) return;
+  if (pdfjsLib.GlobalWorkerOptions.workerPort || pdfjsLib.GlobalWorkerOptions.workerSrc) return;
+
+  try {
+    const testR = await sidecar.fetch('/vendor/pdf.worker.min.js').catch(() => null);
+    if (testR && testR.ok) {
+      pdfjsLib.GlobalWorkerOptions.workerSrc = '/vendor/pdf.worker.min.js';
+      return;
+    }
+  } catch {}
+}
+
+async function renderPdf(filePath) {
   hideAllViewports();
-  const iframe = $('pdf-iframe');
-  iframe.style.display = 'block';
-  $('zoom-controls').style.display = 'none';
-  iframe.src = `/api/file/raw?path=${encodeURIComponent(filePath)}`;
+  showLoading(`正在载入 PDF ${currentFile ? currentFile.name : ''}...`);
+
+  await ensurePdfEngine();
+  await ensurePdfWorker();
+
+  const res = await sidecar.fetch(`/api/file/raw?path=${encodeURIComponent(filePath)}&_t=${Date.now()}`);
+  if (!res.ok) {
+    let errMsg = '无法读取 PDF 文件数据 (文件可能不存在或无法访问)';
+    try {
+      const errJson = await res.json();
+      if (errJson && errJson.error) errMsg = errJson.error;
+    } catch {}
+    throw new Error(errMsg);
+  }
+  const arrayBuffer = await res.arrayBuffer();
+
+  const loadingTask = pdfjsLib.getDocument({
+    data: arrayBuffer,
+    cMapPacked: true,
+  });
+
+  const pdfDoc = await loadingTask.promise;
+  currentPdfDoc = pdfDoc;
+  const numPages = pdfDoc.numPages;
+
+  hideAllViewports();
+  $('pdf-wrapper').style.display = 'flex';
+  $('zoom-controls').style.display = 'flex';
+
+  const container = $('pdf-pages-container');
+  container.innerHTML = '';
+
+  const firstPage = await pdfDoc.getPage(1);
+  const baseViewport = firstPage.getViewport({ scale: 1.0 });
+  currentPdfNaturalWidth = baseViewport.width || 595;
+
+  const dpr = window.devicePixelRatio || 1;
+  const renderScale = Math.max(1.5, Math.min(2.5, dpr * 1.25));
+
+  for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+    const page = pageNum === 1 ? firstPage : await pdfDoc.getPage(pageNum);
+    const pageViewport1x = page.getViewport({ scale: 1.0 });
+    const renderViewport = page.getViewport({ scale: renderScale });
+
+    const pageCard = document.createElement('div');
+    pageCard.className = 'pdf-page-card';
+    pageCard.setAttribute('data-page-number', pageNum);
+
+    const canvas = document.createElement('canvas');
+    canvas.className = 'pdf-page-canvas';
+    canvas.width = Math.floor(renderViewport.width);
+    canvas.height = Math.floor(renderViewport.height);
+    canvas.style.width = `${Math.floor(pageViewport1x.width)}px`;
+    canvas.style.height = `${Math.floor(pageViewport1x.height)}px`;
+    pageCard.appendChild(canvas);
+
+    const pageBadge = document.createElement('div');
+    pageBadge.className = 'pdf-page-badge';
+    pageBadge.textContent = `${pageNum} / ${numPages}`;
+    pageCard.appendChild(pageBadge);
+
+    container.appendChild(pageCard);
+
+    const ctx = canvas.getContext('2d');
+    await page.render({
+      canvasContext: ctx,
+      viewport: renderViewport,
+    }).promise;
+  }
+
+  isAutoFit = true;
+  requestAnimationFrame(() => {
+    fitPdfToWidth();
+    setTimeout(() => {
+      if (isAutoFit) fitPdfToWidth();
+    }, 120);
+  });
+}
+
+function fitPdfToWidth() {
+  const viewport = $('viewport-container');
+  const container = $('pdf-pages-container');
+  if (!viewport || !container || !currentPdfNaturalWidth) return;
+
+  const availableWidth = viewport.clientWidth - 20;
+  if (availableWidth > 0 && currentPdfNaturalWidth > 0) {
+    const scale = availableWidth / currentPdfNaturalWidth;
+    applyPdfZoom(scale);
+    isAutoFit = true;
+  }
+}
+
+function applyPdfZoom(scale) {
+  currentZoom = Math.round(scale * 100);
+  $('zoom-label').textContent = `${currentZoom}%`;
+
+  const container = $('pdf-pages-container');
+  if (!container) return;
+
+  if ('zoom' in container.style) {
+    container.style.zoom = scale;
+  } else {
+    container.style.transform = `scale(${scale})`;
+    container.style.transformOrigin = 'top center';
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -440,7 +824,10 @@ function hideAllViewports() {
   $('loading-state').style.display = 'none';
   $('docx-wrapper').style.display = 'none';
   $('xlsx-wrapper').style.display = 'none';
-  $('pdf-iframe').style.display = 'none';
+  const pdfWrapper = $('pdf-wrapper');
+  if (pdfWrapper) pdfWrapper.style.display = 'none';
+  const pdfIframe = $('pdf-iframe');
+  if (pdfIframe) pdfIframe.style.display = 'none';
   $('text-view').style.display = 'none';
 }
 
@@ -461,17 +848,34 @@ function showLoading(msg) {
 }
 
 // ---------------------------------------------------------------------------
-// Zoom Controls (DOCX)
+// Zoom Controls (DOCX & PDF)
 // ---------------------------------------------------------------------------
 function updateZoom(newPercent) {
   isAutoFit = false;
   const scale = Math.max(0.2, Math.min(3.0, newPercent / 100));
-  applyDocxZoom(scale);
+  if ($('docx-wrapper').style.display !== 'none') {
+    applyDocxZoom(scale);
+  } else if ($('pdf-wrapper') && $('pdf-wrapper').style.display !== 'none') {
+    applyPdfZoom(scale);
+  }
 }
 
 function resetZoom() {
   isAutoFit = false;
-  applyDocxZoom(1.0);
+  if ($('docx-wrapper').style.display !== 'none') {
+    applyDocxZoom(1.0);
+  } else if ($('pdf-wrapper') && $('pdf-wrapper').style.display !== 'none') {
+    applyPdfZoom(1.0);
+  }
+}
+
+function fitCurrentToWidth() {
+  isAutoFit = true;
+  if ($('docx-wrapper').style.display !== 'none') {
+    fitDocxToWidth();
+  } else if ($('pdf-wrapper') && $('pdf-wrapper').style.display !== 'none') {
+    fitPdfToWidth();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -634,6 +1038,47 @@ async function renderRawDroppedFile(file) {
       const data = new Uint8Array(arrayBuffer);
       currentWorkbook = window.XLSX.read(data, { type: 'array' });
       renderSheetTable(currentWorkbook.SheetNames[0]);
+    } else if (ext === '.pdf') {
+      if (!window.pdfjsLib) throw new Error('PDF 离线引擎未就绪');
+      if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
+        pdfjsLib.GlobalWorkerOptions.workerSrc = '/vendor/pdf.worker.min.js';
+      }
+      const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer, cMapPacked: true }).promise;
+      currentPdfDoc = pdfDoc;
+      hideAllViewports();
+      $('pdf-wrapper').style.display = 'flex';
+      $('zoom-controls').style.display = 'flex';
+      const container = $('pdf-pages-container');
+      container.innerHTML = '';
+      const firstPage = await pdfDoc.getPage(1);
+      const baseViewport = firstPage.getViewport({ scale: 1.0 });
+      currentPdfNaturalWidth = baseViewport.width || 595;
+      const dpr = window.devicePixelRatio || 1;
+      const renderScale = Math.max(1.5, Math.min(2.5, dpr * 1.25));
+
+      for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
+        const page = pageNum === 1 ? firstPage : await pdfDoc.getPage(pageNum);
+        const pageViewport1x = page.getViewport({ scale: 1.0 });
+        const renderViewport = page.getViewport({ scale: renderScale });
+        const pageCard = document.createElement('div');
+        pageCard.className = 'pdf-page-card';
+        pageCard.setAttribute('data-page-number', pageNum);
+        const canvas = document.createElement('canvas');
+        canvas.className = 'pdf-page-canvas';
+        canvas.width = Math.floor(renderViewport.width);
+        canvas.height = Math.floor(renderViewport.height);
+        canvas.style.width = `${Math.floor(pageViewport1x.width)}px`;
+        canvas.style.height = `${Math.floor(pageViewport1x.height)}px`;
+        pageCard.appendChild(canvas);
+        const pageBadge = document.createElement('div');
+        pageBadge.className = 'pdf-page-badge';
+        pageBadge.textContent = `${pageNum} / ${pdfDoc.numPages}`;
+        pageCard.appendChild(pageBadge);
+        container.appendChild(pageCard);
+        await page.render({ canvasContext: canvas.getContext('2d'), viewport: renderViewport }).promise;
+      }
+      isAutoFit = true;
+      requestAnimationFrame(() => fitPdfToWidth());
     } else {
       showEmptyState(`暂不支持直接脱机解析 ${ext}`);
     }
@@ -650,44 +1095,12 @@ function initEvents() {
   $('btn-reveal').addEventListener('click', revealInExplorer);
   $('btn-copy-path').addEventListener('click', copyFilePath);
 
-  $('file-select').addEventListener('change', (e) => {
-    const selectedPath = e.target.value;
-    const found = sniffedFiles.find((f) => f.path === selectedPath);
-    if (found) loadFile(found);
-  });
-
-  $('btn-refresh').addEventListener('click', () => refreshFiles());
-
-  $('btn-toggle-manual').addEventListener('click', () => {
-    const bar = $('manual-path-bar');
-    bar.style.display = bar.style.display === 'none' ? 'flex' : 'none';
-    if (bar.style.display === 'flex') $('input-manual-path').focus();
-  });
-
-  $('btn-load-manual').addEventListener('click', () => {
-    const inputPath = $('input-manual-path').value.trim();
-    if (!inputPath) return;
-    const name = inputPath.split(/[\/\\]/).pop();
-    const ext = '.' + name.split('.').pop().toLowerCase();
-    loadFile({
-      name,
-      path: inputPath,
-      size: 0,
-      mtime: Date.now(),
-      ext,
-      source: 'manual',
-    });
-  });
-
-  $('input-manual-path').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') $('btn-load-manual').click();
-  });
-
-  // UI Hot Reload button
+  // Document Reload button (In-place instant silent refresh, never drops host CSS variables)
   const reloadUiBtn = $('btn-reload-ui');
   if (reloadUiBtn) {
-    reloadUiBtn.addEventListener('click', () => {
-      window.location.reload(true);
+    reloadUiBtn.addEventListener('click', async () => {
+      syncAndPreserveTheme();
+      await reloadCurrentDocument(true);
     });
   }
 
@@ -696,54 +1109,75 @@ function initEvents() {
   $('btn-zoom-out').addEventListener('click', () => updateZoom(currentZoom - 10));
   $('btn-zoom-reset').addEventListener('click', resetZoom);
   $('btn-zoom-fit').addEventListener('click', () => {
-    isAutoFit = true;
-    fitDocxToWidth();
+    fitCurrentToWidth();
   });
 
   setupDragAndDrop();
 
-  // Focus & Visibility Auto-Refresh
-  window.addEventListener('focus', () => refreshFiles());
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) refreshFiles();
-  });
-
   // Watch for dynamic resize of the auxiliary side pane
   if (window.ResizeObserver) {
     const ro = new ResizeObserver(() => {
-      if (isAutoFit && currentFile && currentFile.ext === '.docx') {
-        fitDocxToWidth();
+      if (isAutoFit && currentFile) {
+        if (currentFile.ext === '.docx') {
+          fitDocxToWidth();
+        } else if (currentFile.ext === '.pdf') {
+          fitPdfToWidth();
+        }
       }
     });
     ro.observe($('viewport-container'));
   }
 
-  // URL query parameter watcher
-  window.addEventListener('popstate', () => refreshFiles());
-  window.addEventListener('hashchange', () => refreshFiles());
+  // URL query parameter watcher & Window focus trigger (Pill clicks refocus the panel)
+  window.addEventListener('popstate', () => syncWithUrl(true));
+  window.addEventListener('hashchange', () => syncWithUrl(true));
 
-  setInterval(() => {
-    const currentQueryFile = getUrlFileParam();
-    if (currentQueryFile && currentQueryFile !== lastKnownQueryFile) {
-      lastKnownQueryFile = currentQueryFile;
-      refreshFiles(currentQueryFile);
+  // 接收 Antigravity 宿主通过 postMessage 派发的消息
+  window.addEventListener('message', () => {
+    notifyUserActivity(true);
+  });
+
+  // 每次窗口重新获得焦点（例如用户在会话中点击文档胶囊切换过来），强制同步并检查最新文件
+  window.addEventListener('focus', () => {
+    syncAndPreserveTheme();
+    notifyUserActivity(true);
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+      syncAndPreserveTheme();
+      notifyUserActivity(true);
     }
-  }, 1000);
+  });
 
-  if (sidecar.onWorkspaceChange) {
-    sidecar.onWorkspaceChange(() => {
-      refreshFiles();
-    });
-  }
+  // 鼠标划入或交互感知（用户在左侧点完胶囊，鼠标/目光移向右侧侧边栏即可零等待感知最新文件）
+  ['pointerenter', 'mouseenter', 'pointerdown', 'wheel'].forEach((evt) => {
+    window.addEventListener(evt, () => notifyUserActivity(true), { passive: true });
+  });
+
+  // 高频微秒级 URL search 变动监听（纯本地内存字符串比对，零网络请求、零磁盘IO）
+  setInterval(() => {
+    const currentSearch = window.location.search || '';
+    if (currentSearch !== lastKnownSearch) {
+      lastKnownSearch = currentSearch;
+      syncWithUrl(true);
+    }
+  }, 250);
+
+  // 启动自适应平滑心跳（活跃期 2.5s 探测，静置 90s 后彻底休眠）
+  startAdaptiveHeartbeat();
 }
 
 // ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
 document.addEventListener('DOMContentLoaded', () => {
+  syncAndPreserveTheme();
   initEvents();
   setTimeout(() => {
+    syncAndPreserveTheme();
+    lastKnownSearch = window.location.search || '';
     lastKnownQueryFile = getUrlFileParam();
-    refreshFiles(lastKnownQueryFile);
-  }, 100);
+    syncWithUrl(true);
+  }, 50);
 });
