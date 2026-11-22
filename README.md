@@ -9,10 +9,11 @@
 
 | 格式 | 扩展名 | 侧边栏离线预览 | 唤起本地默认程序 / 定位 / 复制路径 |
 | :--- | :--- | :---: | :---: |
-| **Word 文档** | `.docx` | 支持（`docx-preview` 仿真纸张排版） | 支持 |
+| **Word 文档** | `.docx` | 支持（`docx-preview` 仿真纸张排版，保留红头与彩色样式） | 支持 |
 | **Word 旧格式** | `.doc` | 暂不支持（提示一键本地打开） | 支持 |
-| **Excel 表格** | `.xlsx` / `.xls` / `.csv` | 支持（Node 服务端 SheetJS 无损解析 + 多 Sheet 切换） | 支持 |
-| **PDF 文档** | `.pdf` | 支持（PDF.js 高 DPI Canvas 多页流式渲染） | 支持 |
+| **Excel 表格** | `.xlsx` / `.xls` / `.csv` | 支持（服务端 SheetJS 解析 + 自动编码识别 + 表头吸顶 + 多 Sheet 切换） | 支持 |
+| **PDF 文档** | `.pdf` | 支持（PDF.js 离线中文 CMap + 懒渲染 + 划词复制 + 清晰缩放） | 支持 |
+| **文本与配置** | `.txt` / `.md` / `.json` | 支持（等宽字体渲染，JSON 自动美化缩进） | 支持 |
 | **PowerPoint** | `.pptx` / `.ppt` | 暂不支持（提示一键本地打开） | 支持 |
 
 ---
@@ -20,10 +21,10 @@
 ## 核心特性
 
 ### 1. 纯离线多格式侧边栏预览
-- **Word（`.docx`）仿真排版**：内置 `docx-preview` 与 `JSZip`，白底纸张流式呈现段落、表格、页眉页脚与图片；默认横向自适应视口宽度，支持缩放（放大 / 缩小 / `1:1` / 自适应宽度）与窄屏响应。
-- **Excel（`.xlsx` / `.xls` / `.csv`）多工作表浏览**：内置完整版 SheetJS（`xlsx.full.min.js`），优先经由 Node.js 服务端解析（保障 CJK/CP936 编码），支持多 Sheet 标签切换、隔行高亮、长单元格自动换行；服务异常时自动降级前端本地解析。
-- **PDF（`.pdf`）高保真流式渲染**：集成 Mozilla PDF.js（离线 Worker），按设备像素比动态计算渲染分辨率，白底卡片阴影展示、自适应视口宽度并附悬浮页码徽标。
-- **本地拖放直览**：支持将本地 Office 文件直接拖入侧边栏即时预览。
+- **Word（`.docx`）仿真排版**：内置 `docx-preview` 与 `JSZip`，白底纸张流式呈现段落、红头/彩色文字、表格、页眉页脚与图片；默认横向自适应视口宽度，支持按钮及 `Ctrl/Cmd + 滚轮` 缩放与窄屏响应。
+- **Excel（`.xlsx` / `.xls` / `.csv`）多工作表浏览**：内置完整版 SheetJS（`xlsx.full.min.js`），支持 BOM + UTF-8 / `GB18030` 自动解码、多 Sheet 标签切换、表头吸顶冻结、隔行高亮、长单元格自动换行；服务异常时自动降级前端本地解析。
+- **PDF（`.pdf`）高保真懒渲染与文字选择**：集成 Mozilla PDF.js 与完整离线 CMap（168 份 `.bcmap`），支持 `IntersectionObserver` 可视区懒渲染、`TextLayer` 划词复制、缩放防抖清晰重绘与悬浮页码徽标。
+- **纯文本与本地拖放直览**：支持 `.txt` / `.md` / `.json` 预览，以及将本地文件直接拖入侧边栏即时预览。
 
 ### 2. 系统本地程序无缝联动
 - **一键本地打开**：非阻塞瞬时唤起 Microsoft Office、WPS Office 或系统默认关联程序（支持 Windows / macOS / Linux）。
@@ -35,11 +36,10 @@
   ```markdown
   [文件名.docx](sidecar://qy-office-viewer/panel/?file=<URI编码后的文件绝对路径>)
   ```
-- **自适应热重载**：
-  - 活跃期（前 25 秒）每 2.5 秒轻量检查磁盘修改时间戳与大小，智能体改稿保存后自动刷新；
-  - 平稳期（25～90 秒）自动降频，静置超 90 秒后零请求休眠；
-  - 窗口重新聚焦或重新点击胶囊时立即同步最新文件内容。
-- **紧凑顶栏与主题适配**：35px 紧凑顶栏（窄于 360px 自动折叠文字标签），通过 `/preload.js` 自动同步 Antigravity 宿主主题变量。
+- **智能变更监听与保位热重载**：
+  - 后端基于 `fs.watch` 监听文件改动并提供内存态 `/api/file/watch-state`，前端温和感知并在文档保存后自动热重载，同时保留滚动位置、工作表标签与缩放状态；
+  - 精准路径校验：当目标文件不存在时不再静默替换，而是明确提示并展示同目录相似候选供用户主动点击打开。
+- **按需加载与安全加固**：按文档类型懒加载离线渲染库，Windows 原生打开/定位/剪贴板采用 PowerShell `-EncodedCommand` 参数安全唤起，静态/文件接口带扩展名白名单校验。
 
 ---
 
@@ -57,11 +57,13 @@ qy-office-viewer/
     └── panel/                         # 侧边栏 Sidecar 服务与前端
         ├── sidecar.json               # Sidecar 入口、进程与 AUX_PANE 配置
         ├── package.json               # ES Module 声明
-        ├── main.mjs                   # Node.js 后端（静态路由、文件读取、表格解析、系统动作）
-        ├── index.html                 # 侧边栏页面骨架
-        ├── app.js                     # 前端渲染调度、缩放与热重载逻辑
+        ├── lib.mjs                    # 路径校验、CSV 编码识别与系统安全调用工具
+        ├── main.mjs                   # Node.js 后端（缓存静态路由、fs.watch 监听、表格解析、系统动作）
+        ├── index.html                 # 侧边栏页面骨架（按需懒加载引擎）
+        ├── app.js                     # 前端渲染调度、PDF TextLayer 与热重载保位逻辑
         ├── styles.css                 # 主题自适应与文档仿真排版样式
-        └── vendor/                    # 纯离线前端渲染引擎（零外网依赖）
+        └── vendor/                    # 纯离线前端渲染引擎与 CMap（零外网依赖）
+            ├── cmaps/                 # PDF.js 3.11.174 官方离线 CMap（168 份 .bcmap）
             ├── docx-preview.min.js
             ├── jszip.min.js
             ├── xlsx.full.min.js
@@ -103,6 +105,7 @@ pwsh -NoProfile -File .\sync.ps1
 
 | 版本 | 发布日期 | 核心亮点 |
 | :--- | :--- | :--- |
+| **[v1.2.0](https://github.com/cyt7732/qy-office-viewer/releases/tag/v1.2.0)** | 2026-11-22 | 修复 Word 红头涂黑、静默误匹配、Excel 吸顶与 CSV 编码/拖拽、PDF CMap/懒渲染/划词复制、Windows 特殊字符命令注入、`fs.watch` 保位热重载与按需懒加载 |
 | **[v1.1.0](https://github.com/cyt7732/qy-office-viewer/releases/tag/v1.1.0)** | 2026-11-22 | 新增 PDF.js 离线高清多页渲染、Node 服务端无损 CJK 表格解析、自适应心跳热重载、紧凑顶栏重构与安全脱敏 |
 | **[v1.0.0](https://github.com/cyt7732/qy-office-viewer/releases/tag/v1.0.0)** | 2026-10-10 | 首个完整可用版本：Sidecar 胶囊路由、Word 离线仿真排版与自适应宽度、Excel 初版预览、系统程序非阻塞直开/定位/复制 |
 
@@ -110,11 +113,12 @@ pwsh -NoProfile -File .\sync.ps1
 
 ## 后续演进规划（Roadmap）
 
-- [ ] 修复 Word 彩色文本/红头标题被全局深色样式覆盖的问题，优化公文落款识别准确性
-- [ ] 补齐 PDF.js 中文 CMap 资产、可视区懒渲染与 `TextLayer` 划词复制/全文搜索
+- [x] 修复 Word 彩色文本/红头标题被全局深色样式覆盖的问题，优化公文落款识别准确性
+- [x] 补齐 PDF.js 中文 CMap 资产、可视区懒渲染与 `TextLayer` 划词复制
+- [x] 将文件变更监测从高频轮询升级为 `fs.watch` 后端监听，并在热重载后保持阅读滚动位置
+- [x] 补全 `.md` / `.txt` / `.json` 纯文本预览
 - [ ] 接入本地 LibreOffice 无头转换缓存，解锁 `.pptx` / `.ppt` / `.doc` / `.wps` 全格式预览及 Word 精准打印视图切换
-- [ ] 将文件变更监测从心跳轮询升级为 `fs.watch` + SSE 推送，并在热重载后保持阅读滚动位置
-- [ ] 补全顶部最近/会话文档快速切换器，以及 `.md` / `.txt` / `.json` 纯文本预览
+- [ ] 增加 PDF 页内全文搜索（`Ctrl+F`）、页码直达跳转，以及 Excel 表内搜索与顶部会话文档快速切换器
 
 ---
 

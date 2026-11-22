@@ -4,14 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Office 预览</title>
-  <link rel="stylesheet" href="/styles.css?v=3.3">
+  <link rel="stylesheet" href="/styles.css?v=1.2.0">
   <!-- Antigravity Host Bridge -->
   <script src="/preload.js"></script>
-  <!-- Offline Vendor Libraries -->
-  <script src="/vendor/jszip.min.js"></script>
-  <script src="/vendor/docx-preview.min.js"></script>
-  <script src="/vendor/xlsx.full.min.js"></script>
-  <script src="/vendor/pdf.min.js"></script>
 </head>
 <body>
   <!-- Consolidated Compact Header Bar (~34px) -->
@@ -96,9 +91,10 @@
         <line x1="9" y1="15" x2="15" y2="15"></line>
       </svg>
       <div>
-        <p style="font-weight: 500; margin-bottom: 4px;">未指定预览文档</p>
-        <p style="font-size: 11.5px;">请在对话中点击文档胶囊打开，或将本地文件拖入此处</p>
+        <p id="empty-title" style="font-weight: 500; margin-bottom: 4px;">未指定预览文档</p>
+        <p id="empty-subtitle" style="font-size: 11.5px;">请在对话中点击文档胶囊打开，或将本地文件拖入此处</p>
       </div>
+      <div id="empty-candidates" class="missing-candidates" style="display: none;"></div>
     </div>
 
     <!-- Loading State -->
@@ -131,6 +127,6 @@
   <div id="toast" class="toast" style="display: none;"></div>
 
   <!-- Frontend Logic -->
-  <script src="/app.js?v=3.3"></script>
+  <script src="/app.js?v=1.2.0"></script>
 </body>
 </html>

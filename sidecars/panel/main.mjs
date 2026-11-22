@@ -1,358 +1,318 @@
 // QY Office Viewer Backend
-// Sidecar Node.js Service for Antigravity 2.22.0+
+// Sidecar Node.js Service for Antigravity
 
 import { createContext, runInContext } from 'node:vm';
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { homedir, platform, release } from 'node:os';
+import { existsSync, readFileSync, watch } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { platform, release } from 'node:os';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { exec, execFile, spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { Response, SidecarApp } from 'sidecar_sdk';
+import {
+  MIME_TYPES,
+  buildWinClipboardArgs,
+  buildWinOpenArgs,
+  buildWinRevealArgs,
+  decodeCsvBuffer,
+  findSimilarCandidates,
+  getFileType,
+  isAllowedPreviewExt,
+  isSpreadsheetExt,
+  resolveExactPath,
+  safeStat,
+  sanitizeCmapFileName,
+} from './lib.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR || join(HERE, '.data');
-const HISTORY_FILE = join(DATA_DIR, 'recent_files.json');
 const STARTED_AT = Date.now();
-
 const app = new SidecarApp();
 
-// Helper to read local files in UTF-8
-const readLocal = (name) => readFileSync(join(HERE, name), 'utf8');
+const NO_CACHE_HEADERS = {
+  'Cache-Control': 'no-store, no-cache, must-revalidate',
+  'Pragma': 'no-cache',
+};
+
+const STATIC_CACHE_HEADERS = {
+  'Cache-Control': 'public, max-age=86400',
+};
+
+const readLocalText = (name) => readFileSync(join(HERE, name), 'utf8');
+
+function jsonResponse(payload, status = 200) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    contentType: 'application/json; charset=utf-8',
+  });
+}
 
 // ---------------------------------------------------------------------------
-// Static Routes (Strict No-Cache for Instant Hot Reloading)
+// Static & Vendor Routes
 // ---------------------------------------------------------------------------
 app.page('/', () =>
-  new Response(readLocal('index.html'), {
+  new Response(readLocalText('index.html'), {
     contentType: 'text/html; charset=utf-8',
-    headers: { 'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache' },
+    headers: NO_CACHE_HEADERS,
   })
 );
 
 app.api('/app.js', () =>
-  new Response(readLocal('app.js'), {
-    contentType: 'application/javascript',
-    headers: { 'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache' },
+  new Response(readLocalText('app.js'), {
+    contentType: 'application/javascript; charset=utf-8',
+    headers: NO_CACHE_HEADERS,
+  }),
+'GET');
+
+app.api('/lib.mjs', () =>
+  new Response(readLocalText('lib.mjs'), {
+    contentType: 'application/javascript; charset=utf-8',
+    headers: NO_CACHE_HEADERS,
   }),
 'GET');
 
 app.api('/styles.css', () =>
-  new Response(readLocal('styles.css'), {
-    contentType: 'text/css',
-    headers: { 'Cache-Control': 'no-store, no-cache, must-revalidate', 'Pragma': 'no-cache' },
+  new Response(readLocalText('styles.css'), {
+    contentType: 'text/css; charset=utf-8',
+    headers: NO_CACHE_HEADERS,
   }),
 'GET');
 
-// Vendor bundles
-app.api('/vendor/docx-preview.min.js', () =>
-  new Response(readLocal('vendor/docx-preview.min.js'), { contentType: 'application/javascript' }),
-'GET');
+// In-memory cached vendor bundles (zero repeated disk I/O)
+const vendorCache = new Map();
+const VENDOR_ASSETS = new Map([
+  ['/vendor/docx-preview.min.js', 'vendor/docx-preview.min.js'],
+  ['/vendor/jszip.min.js', 'vendor/jszip.min.js'],
+  ['/vendor/xlsx.full.min.js', 'vendor/xlsx.full.min.js'],
+  ['/vendor/pdf.min.js', 'vendor/pdf.min.js'],
+  ['/vendor/pdf.worker.min.js', 'vendor/pdf.worker.min.js'],
+]);
 
-app.api('/vendor/jszip.min.js', () =>
-  new Response(readLocal('vendor/jszip.min.js'), { contentType: 'application/javascript' }),
-'GET');
+for (const [route, relPath] of VENDOR_ASSETS.entries()) {
+  app.api(route, async () => {
+    let buf = vendorCache.get(route);
+    if (!buf) {
+      buf = await readFile(join(HERE, relPath));
+      vendorCache.set(route, buf);
+    }
+    return new Response(buf, {
+      contentType: 'application/javascript; charset=utf-8',
+      headers: STATIC_CACHE_HEADERS,
+    });
+  }, 'GET');
+}
 
-app.api('/vendor/xlsx.mini.min.js', () =>
-  new Response(readLocal('vendor/xlsx.full.min.js'), { contentType: 'application/javascript' }),
-'GET');
+// Offline PDF.js CMap endpoint: GET /api/vendor/cmap?file=<name>.bcmap
+const cmapCache = new Map();
+app.api('/api/vendor/cmap', async (data) => {
+  const safeName = sanitizeCmapFileName(data.file);
+  if (!safeName) {
+    return jsonResponse({ error: '非法的 CMap 文件名' }, 400);
+  }
 
-app.api('/vendor/xlsx.full.min.js', () =>
-  new Response(readLocal('vendor/xlsx.full.min.js'), { contentType: 'application/javascript' }),
-'GET');
+  let buf = cmapCache.get(safeName);
+  if (!buf) {
+    const fullPath = join(HERE, 'vendor', 'cmaps', safeName);
+    if (!existsSync(fullPath)) {
+      return jsonResponse({ error: `CMap 文件不存在: ${safeName}` }, 404);
+    }
+    buf = await readFile(fullPath);
+    cmapCache.set(safeName, buf);
+  }
 
-app.api('/vendor/pdf.min.js', () =>
-  new Response(readLocal('vendor/pdf.min.js'), {
-    contentType: 'application/javascript; charset=utf-8',
-    headers: { 'Cache-Control': 'public, max-age=3600' },
-  }),
-'GET');
-
-app.api('/vendor/pdf.worker.min.js', () =>
-  new Response(readLocal('vendor/pdf.worker.min.js'), {
-    contentType: 'application/javascript; charset=utf-8',
-    headers: { 'Cache-Control': 'public, max-age=3600' },
-  }),
-'GET');
+  return new Response(buf, {
+    contentType: 'application/octet-stream',
+    headers: STATIC_CACHE_HEADERS,
+  });
+}, 'GET');
 
 // ---------------------------------------------------------------------------
-// System & Diagnostic APIs
+// System & Diagnostic API
 // ---------------------------------------------------------------------------
 app.api('/api/status', () => ({
   name: 'qy-office-viewer',
-  version: '1.1.0',
+  version: '1.2.0',
   node: process.version,
   platform: `${platform()} ${release()}`,
   uptimeSeconds: Math.round((Date.now() - STARTED_AT) / 1000),
 }), 'GET');
 
 // ---------------------------------------------------------------------------
-// File Sniffer API (Strictly Office Documents Only)
+// Single Active Directory Watcher (fs.watch + 150ms debounce)
 // ---------------------------------------------------------------------------
-const OFFICE_EXTS = new Set([
-  '.docx', '.doc', '.xlsx', '.xls', '.csv', '.pdf', '.pptx', '.ppt',
-]);
+const normWatchKey = (p) => (platform() === 'win32' ? resolve(p).toLowerCase() : resolve(p));
 
-function getFileType(ext) {
-  switch (ext.toLowerCase()) {
-    case '.docx':
-    case '.doc':
-      return 'word';
-    case '.xlsx':
-    case '.xls':
-    case '.csv':
-      return 'excel';
-    case '.pdf':
-      return 'pdf';
-    case '.pptx':
-    case '.ppt':
-      return 'ppt';
-    default:
-      return 'other';
-  }
-}
-
-function safeStat(filePath) {
-  try {
-    const st = statSync(filePath);
-    return {
-      size: st.size,
-      mtime: st.mtimeMs,
-      isFile: st.isFile(),
-      isDir: st.isDirectory(),
-    };
-  } catch {
-    return null;
-  }
-}
-
-function resolveActualPath(inputPath) {
-  if (!inputPath || typeof inputPath !== 'string') return null;
-  const targetPath = inputPath.trim().replace(/^["']|["']$/g, '');
-  if (existsSync(targetPath)) return targetPath;
-
-  try {
-    const dir = dirname(targetPath);
-    if (!existsSync(dir)) return null;
-
-    const targetBase = basename(targetPath);
-    const targetExt = extname(targetBase).toLowerCase();
-    const targetStem = basename(targetBase, extname(targetBase)).toLowerCase();
-
-    const entries = readdirSync(dir, { withFileTypes: true });
-    const candidates = [];
-
-    for (const ent of entries) {
-      if (!ent.isFile()) continue;
-      const fName = ent.name;
-      const fExt = extname(fName).toLowerCase();
-      if (fExt !== targetExt) continue;
-
-      const fStem = basename(fName, extname(fName)).toLowerCase();
-      if (fStem === targetStem) {
-        return join(dir, fName);
-      }
-
-      const cleanTarget = targetStem.replace(/[\s_\-\(\)（）【】\[\]]/g, '');
-      const cleanCandidate = fStem.replace(/[\s_\-\(\)（）【】\[\]]/g, '');
-
-      let matches = 0;
-      const candidateChars = Array.from(cleanCandidate);
-      for (const ch of Array.from(cleanTarget)) {
-        const idx = candidateChars.indexOf(ch);
-        if (idx !== -1) {
-          matches++;
-          candidateChars.splice(idx, 1);
-        }
-      }
-      const similarity = (2 * matches) / (cleanTarget.length + cleanCandidate.length);
-      candidates.push({ name: fName, path: join(dir, fName), similarity });
-    }
-
-    if (candidates.length === 1 && candidates[0].similarity >= 0.5) {
-      console.log(`[resolveActualPath] 唯一候选文件智能对齐: "${targetBase}" -> "${candidates[0].name}" (相似度: ${(candidates[0].similarity * 100).toFixed(1)}%)`);
-      return candidates[0].path;
-    }
-
-    if (candidates.length > 1) {
-      candidates.sort((a, b) => b.similarity - a.similarity);
-      if (candidates[0].similarity >= 0.75) {
-        console.log(`[resolveActualPath] 高相似度候选文件智能对齐: "${targetBase}" -> "${candidates[0].name}" (相似度: ${(candidates[0].similarity * 100).toFixed(1)}%)`);
-        return candidates[0].path;
-      }
-    }
-  } catch (err) {
-    console.warn('[resolveActualPath] Notice:', err.message);
-  }
-
-  return null;
-}
-
-
-function scanDirForFiles(dirPath, maxDepth = 2, currentDepth = 0, ignoreDirs = new Set(['.git', 'node_modules', '.venv', 'dist', 'build', '.data', '.system_generated', '.user_uploaded', 'scratch'])) {
-  if (currentDepth > maxDepth || !existsSync(dirPath)) return [];
-  const results = [];
-  try {
-    const entries = readdirSync(dirPath, { withFileTypes: true });
-    for (const ent of entries) {
-      if (ent.name.startsWith('.') && ent.name !== '.gemini') {
-        if (ent.isDirectory()) continue;
-      }
-      const fullPath = join(dirPath, ent.name);
-      if (ent.isDirectory()) {
-        if (!ignoreDirs.has(ent.name.toLowerCase())) {
-          results.push(...scanDirForFiles(fullPath, maxDepth, currentDepth + 1, ignoreDirs));
-        }
-      } else if (ent.isFile()) {
-        const ext = extname(ent.name).toLowerCase();
-        if (OFFICE_EXTS.has(ext)) {
-          const st = safeStat(fullPath);
-          if (st) {
-            results.push({
-              name: ent.name,
-              path: fullPath,
-              size: st.size,
-              mtime: st.mtime,
-              ext,
-              type: getFileType(ext),
-            });
-          }
-        }
-      }
-    }
-  } catch (err) {
-    console.error(`[sniff] Error reading dir ${dirPath}:`, err.message);
-  }
-  return results;
-}
-
-// GET /api/files/sniff: Discovers documents from conversation artifacts, active workspaces & recent history
-app.api('/api/files/sniff', (data) => {
-  const conversationId = data.conversationId;
-  let workspacePaths = [];
-  if (data.workspaces) {
-    try {
-      const parsed = typeof data.workspaces === 'string' ? JSON.parse(data.workspaces) : data.workspaces;
-      if (Array.isArray(parsed)) {
-        workspacePaths = parsed.map((u) => u.startsWith('file://') ? fileURLToPath(u) : u);
-      }
-    } catch {
-      // ignore JSON parse error
-    }
-  }
-
-  const fileMap = new Map();
-
-  // 1. Sniff conversation artifacts directory
-  if (conversationId) {
-    const convDir = join(homedir(), '.gemini', 'antigravity', 'brain', conversationId);
-    if (existsSync(convDir)) {
-      const convFiles = scanDirForFiles(convDir, 1);
-      for (const item of convFiles) {
-        fileMap.set(item.path, { ...item, source: 'conversation' });
-      }
-    }
-  }
-
-  // 2. Sniff workspaces
-  for (const wsPath of workspacePaths) {
-    if (existsSync(wsPath)) {
-      const wsFiles = scanDirForFiles(wsPath, 2);
-      for (const item of wsFiles) {
-        if (!fileMap.has(item.path)) {
-          fileMap.set(item.path, { ...item, source: 'workspace' });
-        }
-      }
-    }
-  }
-
-  // 3. Include recent history files (only if they are valid office files)
-  const recent = loadRecentFiles();
-  for (const item of recent) {
-    if (existsSync(item.path) && !fileMap.has(item.path)) {
-      const ext = extname(item.path).toLowerCase();
-      if (OFFICE_EXTS.has(ext)) {
-        const st = safeStat(item.path);
-        if (st) {
-          fileMap.set(item.path, {
-            name: basename(item.path),
-            path: item.path,
-            size: st.size,
-            mtime: st.mtime,
-            ext,
-            type: getFileType(ext),
-            source: 'recent',
-          });
-        }
-      }
-    }
-  }
-
-  // Convert map to array and sort by modified time desc (newest first)
-  const allFiles = Array.from(fileMap.values()).sort((a, b) => b.mtime - a.mtime);
-  return { files: allFiles };
-}, 'GET');
-
-// ---------------------------------------------------------------------------
-// File Content & Meta APIs
-// ---------------------------------------------------------------------------
-const MIME_TYPES = {
-  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  '.pdf': 'application/pdf',
-  '.doc': 'application/msword',
-  '.xls': 'application/vnd.ms-excel',
-  '.csv': 'text/csv; charset=utf-8',
-  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-  '.ppt': 'application/vnd.ms-powerpoint',
+let activeWatch = {
+  key: null,
+  targetPath: null,
+  dirPath: null,
+  fileNameLower: null,
+  watcher: null,
+  debounceTimer: null,
+  state: null,
 };
 
-// GET /api/file/raw?path=...
-app.api('/api/file/raw', (data) => {
-  const actualPath = resolveActualPath(data.path);
-  if (!actualPath) {
-    return new Response(JSON.stringify({ error: '文件不存在或路径无效' }), {
-      status: 404,
-      contentType: 'application/json',
+function closeActiveWatch() {
+  if (activeWatch.debounceTimer) {
+    clearTimeout(activeWatch.debounceTimer);
+    activeWatch.debounceTimer = null;
+  }
+  if (activeWatch.watcher) {
+    try {
+      activeWatch.watcher.close();
+    } catch {
+      // ignore close errors
+    }
+    activeWatch.watcher = null;
+  }
+}
+
+function refreshActiveWatchState() {
+  if (!activeWatch.targetPath || !activeWatch.state) return null;
+  const st = safeStat(activeWatch.targetPath);
+  const prev = activeWatch.state;
+
+  if (!st || !st.isFile) {
+    if (prev.exists !== false) {
+      activeWatch.state = {
+        exists: false,
+        version: prev.version + 1,
+        mtime: 0,
+        size: 0,
+      };
+    }
+  } else if (!prev.exists || st.mtime !== prev.mtime || st.size !== prev.size) {
+    activeWatch.state = {
+      exists: true,
+      version: prev.version + 1,
+      mtime: st.mtime,
+      size: st.size,
+    };
+  }
+  return activeWatch.state;
+}
+
+function ensureWatchingFile(resolvedPath, forceRefreshStat = false) {
+  const key = normWatchKey(resolvedPath);
+  if (activeWatch.key === key && activeWatch.watcher) {
+    if (forceRefreshStat) {
+      refreshActiveWatchState();
+    }
+    return activeWatch.state;
+  }
+
+  closeActiveWatch();
+
+  const st = safeStat(resolvedPath);
+  const dirPath = dirname(resolvedPath);
+  const fileNameLower = basename(resolvedPath).toLowerCase();
+
+  activeWatch = {
+    key,
+    targetPath: resolvedPath,
+    dirPath,
+    fileNameLower,
+    watcher: null,
+    debounceTimer: null,
+    state: st && st.isFile
+      ? { exists: true, version: 1, mtime: st.mtime, size: st.size }
+      : { exists: false, version: 1, mtime: 0, size: 0 },
+  };
+
+  try {
+    const watcher = watch(dirPath, (_eventType, changedFile) => {
+      if (!changedFile || String(changedFile).toLowerCase() === activeWatch.fileNameLower) {
+        if (activeWatch.debounceTimer) clearTimeout(activeWatch.debounceTimer);
+        activeWatch.debounceTimer = setTimeout(() => {
+          activeWatch.debounceTimer = null;
+          refreshActiveWatchState();
+        }, 150);
+      }
     });
+    watcher.on('error', (err) => {
+      console.warn('[fs.watch] Watcher error:', err.message);
+      closeActiveWatch();
+    });
+    activeWatch.watcher = watcher;
+  } catch (err) {
+    console.warn('[fs.watch] Could not watch directory:', err.message);
+  }
+
+  return activeWatch.state;
+}
+
+// ---------------------------------------------------------------------------
+// File Content, Meta & Watch State APIs
+// ---------------------------------------------------------------------------
+
+// GET /api/file/raw?path=...
+app.api('/api/file/raw', async (data) => {
+  const rawInput = typeof data.path === 'string' ? data.path.trim().replace(/^["']|["']$/g, '') : '';
+  if (!rawInput) {
+    return jsonResponse({ error: '缺少文件路径参数' }, 400);
+  }
+
+  const actualPath = resolveExactPath(rawInput);
+  if (!actualPath) {
+    const existingNonFile = existsSync(rawInput) && !safeStat(rawInput)?.isFile;
+    if (existingNonFile) {
+      return jsonResponse({ error: '目标路径不是普通文件' }, 400);
+    }
+    return jsonResponse({ error: '文件不存在或路径无效' }, 404);
+  }
+
+  if (!isAllowedPreviewExt(actualPath)) {
+    return jsonResponse({ error: '不允许预览此类型文件' }, 403);
+  }
+
+  const st = safeStat(actualPath);
+  if (!st || !st.isFile) {
+    return jsonResponse({ error: '目标路径不是有效文件' }, 400);
   }
 
   const ext = extname(actualPath).toLowerCase();
   const contentType = MIME_TYPES[ext] || 'application/octet-stream';
 
   try {
-    const buffer = readFileSync(actualPath);
-    // Record to recent history
-    addRecentFile(actualPath);
+    const buffer = await readFile(actualPath);
     return new Response(buffer, {
       contentType,
       headers: {
         'Content-Disposition': `inline; filename="${encodeURIComponent(basename(actualPath))}"`,
-        'Cache-Control': 'no-store, no-cache, must-revalidate',
-        'Pragma': 'no-cache',
+        ...NO_CACHE_HEADERS,
         'Expires': '0',
       },
     });
   } catch (err) {
-    return new Response(JSON.stringify({ error: err.message }), {
-      status: 500,
-      contentType: 'application/json',
-    });
+    return jsonResponse({ error: err.message }, 500);
   }
 }, 'GET');
 
 // GET /api/file/meta?path=...
 app.api('/api/file/meta', (data) => {
-  const actualPath = resolveActualPath(data.path);
+  const actualPath = resolveExactPath(data.path);
   if (!actualPath) {
-    return { error: '文件不存在或路径无效' };
+    return {
+      exists: false,
+      error: '文件不存在或路径无效',
+      requestedPath: data.path || '',
+      candidates: findSimilarCandidates(data.path),
+    };
   }
-  const st = safeStat(actualPath);
+
   const ext = extname(actualPath).toLowerCase();
+  const allowed = isAllowedPreviewExt(actualPath);
+  const st = safeStat(actualPath);
+
+  if (allowed) {
+    ensureWatchingFile(actualPath, true);
+  }
+
   return {
+    exists: true,
+    allowed,
     name: basename(actualPath),
     path: actualPath,
     originalPath: data.path,
-    resolved: actualPath !== data.path,
     size: st?.size ?? 0,
     mtime: st?.mtime ?? 0,
     ext,
@@ -360,7 +320,38 @@ app.api('/api/file/meta', (data) => {
   };
 }, 'GET');
 
-// Server-side Spreadsheet Parser (100% CJK & CP936 Encoding Lossless Guarantee)
+// GET /api/file/watch-state?path=...
+app.api('/api/file/watch-state', (data) => {
+  const rawInput = typeof data.path === 'string' ? data.path.trim().replace(/^["']|["']$/g, '') : '';
+  if (!rawInput) {
+    return { exists: false, version: 0, mtime: 0, size: 0 };
+  }
+
+  const cleanKey = normWatchKey(rawInput);
+  if (activeWatch.key === cleanKey && activeWatch.watcher && activeWatch.state) {
+    return {
+      path: activeWatch.targetPath,
+      ...activeWatch.state,
+    };
+  }
+
+  const actualPath = resolveExactPath(rawInput);
+  if (!actualPath) {
+    return { exists: false, version: 0, mtime: 0, size: 0 };
+  }
+
+  if (!isAllowedPreviewExt(actualPath)) {
+    return jsonResponse({ exists: false, error: '不允许预览此类型文件' }, 403);
+  }
+
+  const state = ensureWatchingFile(actualPath, false);
+  return {
+    path: actualPath,
+    ...state,
+  };
+}, 'GET');
+
+// Server-side Spreadsheet Parser (BOM + UTF-8/GB18030 lossless CSV & XLSX)
 let cachedXLSX = null;
 function getBackendXLSX() {
   if (!cachedXLSX) {
@@ -374,16 +365,25 @@ function getBackendXLSX() {
 }
 
 // GET /api/file/spreadsheet?path=...
-app.api('/api/file/spreadsheet', (data) => {
-  const actualPath = resolveActualPath(data.path);
+app.api('/api/file/spreadsheet', async (data) => {
+  const actualPath = resolveExactPath(data.path);
   if (!actualPath) {
-    return { ok: false, error: '文件不存在或路径无效' };
+    return jsonResponse({ ok: false, error: '文件不存在或路径无效' }, 404);
+  }
+
+  if (!isSpreadsheetExt(actualPath)) {
+    return jsonResponse({ ok: false, error: '不支持作为表格解析的文件类型' }, 403);
   }
 
   try {
     const xlsxLib = getBackendXLSX();
-    const buf = readFileSync(actualPath);
-    const wb = xlsxLib.read(buf, { type: 'buffer' });
+    const buf = await readFile(actualPath);
+    const ext = extname(actualPath).toLowerCase();
+
+    const wb = ext === '.csv'
+      ? xlsxLib.read(decodeCsvBuffer(buf), { type: 'string' })
+      : xlsxLib.read(buf, { type: 'buffer' });
+
     const sheetNames = wb.SheetNames || [];
     const sheets = {};
 
@@ -399,7 +399,6 @@ app.api('/api/file/spreadsheet', (data) => {
       }
     }
 
-    addRecentFile(actualPath);
     return {
       ok: true,
       sheetNames,
@@ -407,28 +406,28 @@ app.api('/api/file/spreadsheet', (data) => {
     };
   } catch (err) {
     console.error('[spreadsheet] Backend parse error:', err);
-    return { ok: false, error: err.message };
+    return jsonResponse({ ok: false, error: err.message }, 500);
   }
 }, 'GET');
 
 // ---------------------------------------------------------------------------
-// Native System Actions (P0)
+// Native System Actions (Safe Spawning without cmd.exe injection)
 // ---------------------------------------------------------------------------
 
 // POST /api/action/open-default { path }
 app.api('/api/action/open-default', (data) => {
-  const actualPath = resolveActualPath(data.path);
+  const actualPath = resolveExactPath(data.path);
   if (!actualPath) {
     return { ok: false, error: '文件不存在或路径无效' };
   }
 
   const absPath = resolve(actualPath);
-  addRecentFile(absPath);
-
   const currentPlatform = platform();
+
   try {
     if (currentPlatform === 'win32') {
-      const child = spawn('cmd.exe', ['/c', 'start', '', absPath], {
+      const { command, args } = buildWinOpenArgs(absPath);
+      const child = spawn(command, args, {
         detached: true,
         stdio: 'ignore',
         windowsHide: true,
@@ -450,7 +449,7 @@ app.api('/api/action/open-default', (data) => {
 
 // POST /api/action/reveal { path }
 app.api('/api/action/reveal', (data) => {
-  const actualPath = resolveActualPath(data.path);
+  const actualPath = resolveExactPath(data.path);
   if (!actualPath) {
     return { ok: false, error: '文件不存在或路径无效' };
   }
@@ -460,9 +459,11 @@ app.api('/api/action/reveal', (data) => {
 
   try {
     if (currentPlatform === 'win32') {
-      const child = spawn('explorer.exe', [`/select,${absPath}`], {
+      const { command, args } = buildWinRevealArgs(absPath);
+      const child = spawn(command, args, {
         detached: true,
         stdio: 'ignore',
+        windowsHide: true,
       });
       child.unref();
     } else if (currentPlatform === 'darwin') {
@@ -489,8 +490,8 @@ app.api('/api/action/copy-clipboard', (data) => {
   return new Promise((resolveResult) => {
     const currentPlatform = platform();
     if (currentPlatform === 'win32') {
-      const b64 = Buffer.from(text, 'utf8').toString('base64');
-      execFile('powershell.exe', ['-NoProfile', '-Command', `Set-Clipboard -Value ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${b64}')))`], (err) => {
+      const { command, args } = buildWinClipboardArgs(text);
+      execFile(command, args, { windowsHide: true }, (err) => {
         if (err) {
           console.error('[copy-clipboard] Failed:', err);
           resolveResult({ ok: false, error: err.message });
@@ -515,29 +516,5 @@ app.api('/api/action/copy-clipboard', (data) => {
     }
   });
 });
-
-// ---------------------------------------------------------------------------
-// Recent Files Persistence
-// ---------------------------------------------------------------------------
-function loadRecentFiles() {
-  if (!existsSync(HISTORY_FILE)) return [];
-  try {
-    return JSON.parse(readFileSync(HISTORY_FILE, 'utf8'));
-  } catch {
-    return [];
-  }
-}
-
-function addRecentFile(filePath) {
-  try {
-    mkdirSync(DATA_DIR, { recursive: true });
-    let list = loadRecentFiles().filter((i) => i.path !== filePath);
-    list.unshift({ path: filePath, openedAt: Date.now() });
-    if (list.length > 20) list = list.slice(0, 20);
-    writeFileSync(HISTORY_FILE, JSON.stringify(list, null, 2), 'utf8');
-  } catch (err) {
-    console.error('[recent] Failed to save recent file:', err.message);
-  }
-}
 
 app.run();

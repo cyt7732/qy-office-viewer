@@ -4,6 +4,32 @@
 
 ---
 
+## [v1.2.0] - 2026-11-22
+
+### 修复 (Fixed)
+- **Word 红头与彩色排版保留**：移除 `styles.css` 中对 `section.docx` 后代元素的 `color: #111827 !important` 强制覆盖，改由页面容器提供默认基色，完整保留红头标题、印章及高亮标注色彩。
+- **杜绝同名相近文件静默张冠李戴**：移除后端 `resolveActualPath` 模糊自动替换逻辑，改为严格精确匹配；路径未命中时返回 `exists: false` 及同目录相似候选列表，在前端明确提示并由用户点击确认。
+- **PDF 中文 CMap、懒渲染、划词复制与竞态隔离**：
+  - 补齐 `pdfjs-dist@3.11.174` 全套 168 个离线 `.bcmap` 文件及 `/api/vendor/cmap` 安全路由，解决非嵌字中文 PDF 丢字问题；
+  - 引入 `IntersectionObserver` 可视区懒渲染、`TextLayer` 透明文字层（支持划词复制）、缩放防抖清晰重绘与 `Ctrl/Cmd + 滚轮` 缩放；
+  - 新增 `activeRenderToken` 并发取消令牌并在切换时销毁上一个 `PDFDocumentProxy`，彻底杜绝快速切换导致的串页与内存泄漏。
+- **Excel 吸顶表头、脱机拖拽与 CSV 编码修复**：
+  - 渲染表格时自动将首行提升为 `<thead><th>`，让表头在纵向滚动时真正吸顶；
+  - 修复脱机拖拽 Excel/CSV 时未构建 `sheetsMap` 与工作表标签导致的空白 Bug，统一多端表格挂载逻辑；
+  - 新增 BOM 检测 + UTF-8 严格校验 + `GB18030` 自动回退解码，兼容无 BOM UTF-8 与中文 GBK/CP936 CSV。
+- **公文落款后处理防误伤与换行控制**：缩小 `fixDocxSignatures` 扫描范围至正文末尾 15 个非空段落（排除表格/页眉/页脚/列表及含句中标点的句子），取消激进全局扫描与强制 `nowrap` 溢出。
+- **Windows 特殊字符直开与文件访问安全加固**：
+  - Windows 下「打开 / 定位 / 复制剪贴板」全面改用 `pwsh`（回退 `powershell.exe`）`-EncodedCommand` + 单引号安全转义，彻底消除 `cmd.exe /c start` 命令注入风险及 `&`、`^`、`%`、`,` 路径断链问题；
+  - `/api/file/raw` 与 `/api/file/meta` 补充预览扩展名白名单校验（非白名单返回 HTTP 403）。
+- **纯文本预览补齐**：实现 `.txt`、`.md`、`.json`（自动格式化缩进）预览与拖放解析。
+
+### 优化与重构 (Changed & Performance)
+- **后端 `fs.watch` 变更追踪 + 热重载状态保持**：新增 `/api/file/watch-state` 内存态监听接口，移除鼠标移入与普通滚轮发请求的事件监听；热重载同一文档时自动保留滚动位置、当前 Sheet 标签与缩放比例。
+- **按需懒加载与静态资源内存缓存**：移除 `index.html` 首屏阻塞加载的全家桶 `<script>`，改为按文档类型动态加载；后端对 `vendor/` 与 `cmaps/` 启用进程内存缓存。
+- **主题适配与代码瘦身**：移除锁死主题的 `localStorage` 内联覆盖与硬编码视口暗色底色，清理死代码并将纯逻辑抽离至 `lib.mjs`。
+
+---
+
 ## [v1.1.0] - 2026-11-22
 
 ### 新增 (Added)

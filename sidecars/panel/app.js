@@ -8,26 +8,38 @@ const $ = (id) => document.getElementById(id);
 // State
 // ---------------------------------------------------------------------------
 let currentFile = null;
-let sniffedFiles = [];
 let currentZoom = 100;
 let isAutoFit = true;
 let currentDocNaturalWidth = 816;
-let currentPdfDoc = null;
 let currentPdfNaturalWidth = 595;
-let currentWorkbook = null;
 let activeSheetName = null;
+let currentSheetsMap = {};
 let toastTimer = null;
+
+// Concurrency cancellation token (prevents interleaved/stale renders)
+let activeRenderToken = 0;
 
 // URL & Query Routing State
 let lastKnownSearch = '';
-let lastKnownQueryFile = null;
-let lastKnownQueryTimestamp = null;
 
-// Smart On-Demand Interaction & Dynamic Heartbeat State
+// Adaptive Watch State Check
 let isCheckingModification = false;
 let lastCheckTime = 0;
 let lastActivityTime = Date.now();
 let heartbeatTimer = null;
+
+// Script Lazy-Loader Cache
+const loadedScripts = new Map();
+
+// PDF Lazy & TextLayer State
+const pdfState = {
+  doc: null,
+  observer: null,
+  pages: [],
+  scale: 1.0,
+  zoomDebounceTimer: null,
+  visiblePages: new Set(),
+};
 
 // ---------------------------------------------------------------------------
 // Helpers & Toasts
@@ -44,11 +56,11 @@ function toast(message, type = 'info') {
 }
 
 function formatBytes(bytes) {
-  if (bytes === 0) return '0 B';
+  if (!bytes) return '0 B';
   const k = 1024;
   const sizes = ['B', 'KB', 'MB', 'GB'];
   const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
 }
 
 function formatDate(timestamp) {
@@ -81,53 +93,165 @@ function getUrlParams() {
   }
 }
 
-function getUrlFileParam() {
-  return getUrlParams().file;
-}
-
 function normPath(p) {
   return (p || '').replace(/\\/g, '/').toLowerCase();
 }
 
-// ---------------------------------------------------------------------------
-// Host Theme Synchronization & Preservation
-// ---------------------------------------------------------------------------
-function syncAndPreserveTheme() {
-  try {
-    const rootStyle = getComputedStyle(document.documentElement);
-    const primaryVal = rootStyle.getPropertyValue('--primary').trim();
-    const bgVal = rootStyle.getPropertyValue('--background').trim();
+function getBaseName(p) {
+  return (p || '').split(/[\/\\]/).pop() || '';
+}
 
-    if (primaryVal && primaryVal !== '#2563eb') {
-      localStorage.setItem('qy_theme_primary', primaryVal);
-      if (bgVal) localStorage.setItem('qy_theme_bg', bgVal);
-    } else {
-      const savedPrimary = localStorage.getItem('qy_theme_primary');
-      const savedBg = localStorage.getItem('qy_theme_bg');
-      if (savedPrimary) {
-        document.documentElement.style.setProperty('--primary', savedPrimary);
-        document.documentElement.style.setProperty('--primary-color', savedPrimary);
-      }
-      if (savedBg) {
-        document.documentElement.style.setProperty('--background', savedBg);
-        document.documentElement.style.setProperty('--bg-color', savedBg);
-      }
+function clampScale(scale) {
+  return Math.max(0.25, Math.min(3.0, scale));
+}
+
+function decodeTextBuffer(arrayBuffer) {
+  const bytes = new Uint8Array(arrayBuffer);
+  if (bytes.length === 0) return '';
+
+  // UTF-8 BOM
+  if (bytes.length >= 3 && bytes[0] === 0xEF && bytes[1] === 0xBB && bytes[2] === 0xBF) {
+    return new TextDecoder('utf-8').decode(bytes.subarray(3));
+  }
+  // UTF-16LE BOM
+  if (bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xFE) {
+    return new TextDecoder('utf-16le').decode(bytes.subarray(2));
+  }
+  // UTF-16BE BOM
+  if (bytes.length >= 2 && bytes[0] === 0xFE && bytes[1] === 0xFF) {
+    const payload = bytes.subarray(2);
+    const evenLen = payload.length - (payload.length % 2);
+    const swapped = new Uint8Array(evenLen);
+    for (let i = 0; i < evenLen; i += 2) {
+      swapped[i] = payload[i + 1];
+      swapped[i + 1] = payload[i];
     }
-  } catch {}
+    return new TextDecoder('utf-16le').decode(swapped);
+  }
+
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return new TextDecoder('gb18030').decode(bytes);
+  }
 }
 
 // ---------------------------------------------------------------------------
-// Document Route & Synchronizer (Always Fresh & Dynamic Auto-Watcher)
+// On-Demand Vendor Script Loader
+// ---------------------------------------------------------------------------
+function loadScriptOnce(src) {
+  if (loadedScripts.has(src)) {
+    return loadedScripts.get(src);
+  }
+
+  const promise = new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = src;
+    script.async = true;
+    script.onload = () => resolve();
+    script.onerror = () => {
+      loadedScripts.delete(src);
+      reject(new Error(`加载离线渲染引擎失败: ${src}`));
+    };
+    document.head.appendChild(script);
+  });
+
+  loadedScripts.set(src, promise);
+  return promise;
+}
+
+async function ensureDocxEngine() {
+  if (!window.JSZip) {
+    await loadScriptOnce('/vendor/jszip.min.js');
+  }
+  if (!window.docx || !window.docx.renderAsync) {
+    await loadScriptOnce('/vendor/docx-preview.min.js');
+  }
+  if (!window.docx || !window.docx.renderAsync) {
+    throw new Error('docx-preview 引擎未就绪');
+  }
+}
+
+async function ensureXlsxEngine() {
+  if (!window.XLSX) {
+    await loadScriptOnce('/vendor/xlsx.full.min.js');
+  }
+  if (!window.XLSX) {
+    throw new Error('XLSX 引擎未就绪');
+  }
+}
+
+async function ensurePdfEngine() {
+  if (!window.pdfjsLib) {
+    await loadScriptOnce('/vendor/pdf.min.js');
+  }
+  if (!window.pdfjsLib) {
+    throw new Error('PDF 离线引擎 (pdf.min.js) 尚未完成加载');
+  }
+  if (!window.pdfjsLib.GlobalWorkerOptions.workerSrc) {
+    window.pdfjsLib.GlobalWorkerOptions.workerSrc = '/vendor/pdf.worker.min.js';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// View State Capture & Restore (Hot-Reload Scroll/Sheet Preservation)
+// ---------------------------------------------------------------------------
+function getActiveScrollElement() {
+  if ($('docx-wrapper').style.display !== 'none') return $('viewport-container');
+  if ($('pdf-wrapper').style.display !== 'none') return $('pdf-wrapper');
+  if ($('xlsx-wrapper').style.display !== 'none') return $('xlsx-table-wrapper');
+  if ($('text-view').style.display !== 'none') return $('text-view');
+  return null;
+}
+
+function captureViewState() {
+  const scrollEl = getActiveScrollElement();
+  const scrollTop = scrollEl ? scrollEl.scrollTop : 0;
+  const scrollLeft = scrollEl ? scrollEl.scrollLeft : 0;
+  const maxScroll = scrollEl ? Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight) : 0;
+  const scrollRatio = maxScroll > 0 ? scrollTop / maxScroll : 0;
+
+  return {
+    filePath: currentFile ? normPath(currentFile.path) : null,
+    scrollTop,
+    scrollLeft,
+    scrollRatio,
+    activeSheetName,
+    isAutoFit,
+    scale: currentZoom / 100,
+  };
+}
+
+function restoreScrollPosition(scrollEl, viewState) {
+  if (!scrollEl || !viewState) return;
+  const applyScroll = () => {
+    const maxScroll = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight);
+    if (maxScroll > 0 && viewState.scrollRatio > 0) {
+      scrollEl.scrollTop = Math.min(maxScroll, Math.round(viewState.scrollRatio * maxScroll));
+    } else if (viewState.scrollTop > 0) {
+      scrollEl.scrollTop = Math.min(maxScroll, viewState.scrollTop);
+    }
+    if (viewState.scrollLeft > 0) {
+      scrollEl.scrollLeft = viewState.scrollLeft;
+    }
+  };
+  applyScroll();
+  requestAnimationFrame(applyScroll);
+}
+
+// ---------------------------------------------------------------------------
+// Document Route & Synchronizer
 // ---------------------------------------------------------------------------
 async function syncWithUrl(force = false) {
-  const { file: urlFile, timestamp: urlTimestamp } = getUrlParams();
+  const { file: urlFile } = getUrlParams();
   lastKnownSearch = window.location.search || '';
-  lastKnownQueryFile = urlFile;
-  lastKnownQueryTimestamp = urlTimestamp;
 
   if (!urlFile) {
     if (!currentFile) {
-      showEmptyState('未指定预览文档，请在对话中点击文档胶囊打开');
+      showEmptyState(
+        '未指定预览文档',
+        '请在对话中点击文档胶囊打开，或将本地文件拖入此处'
+      );
       updateButtonsState(null);
       updateMetaDisplay(null);
       $('header-status').textContent = '就绪';
@@ -144,112 +268,160 @@ async function syncWithUrl(force = false) {
     console.warn('[syncWithUrl] Meta query notice:', err);
   }
 
-  // 同一文件若非强制刷新，检查磁盘时间戳与文件大小是否变化
+  if (meta && meta.exists === false) {
+    showMissingFileState(urlFile, meta.candidates || []);
+    return;
+  }
+
+  if (meta && meta.allowed === false) {
+    cleanupPdfState();
+    currentFile = null;
+    updateButtonsState(null);
+    updateMetaDisplay(null);
+    $('header-status').textContent = '不支持';
+    showEmptyState(`暂不支持预览 ${meta.ext || '该'} 类型文件`, '仅支持常见 Office 与文本格式预览');
+    return;
+  }
+
   if (isSameFile && !force) {
     if (meta && currentFile.mtime && meta.mtime === currentFile.mtime && meta.size === currentFile.size) {
-      return; // 磁盘无改动，保持当前视图
+      return;
     }
   }
 
   const effectivePath = meta?.path || urlFile;
-  const name = meta?.name || effectivePath.split(/[\/\\]/).pop();
-  const ext = meta?.ext || ('.' + name.split('.').pop().toLowerCase());
-  let fileInfo = {
+  const name = meta?.name || getBaseName(effectivePath);
+  const ext = meta?.ext || (name.includes('.') ? '.' + name.split('.').pop().toLowerCase() : '');
+
+  let watchVersion = currentFile?.watchVersion ?? 0;
+  try {
+    const ws = await callApi(`/api/file/watch-state?path=${encodeURIComponent(effectivePath)}&_t=${Date.now()}`);
+    if (ws && typeof ws.version === 'number') watchVersion = ws.version;
+  } catch {
+    // ignore initial watch-state error
+  }
+
+  const fileInfo = {
     name,
     path: effectivePath,
     originalRequestedPath: urlFile,
     ext,
     size: meta?.size || 0,
     mtime: meta?.mtime || Date.now(),
+    watchVersion,
   };
 
-  notifyUserActivity(false);
-  await loadFile(fileInfo);
+  const preserveViewState = isSameFile ? captureViewState() : null;
+  markUserActivity();
+  await loadFile(fileInfo, { preserveViewState });
 }
 
-// 重新加载当前正在查看的文档
 async function reloadCurrentDocument(showToastNotice = true) {
-  if (!currentFile || !currentFile.path) return;
+  if (!currentFile || !currentFile.path || currentFile.isMemoryOnly) return;
+
+  const preserveViewState = captureViewState();
+
   try {
     const meta = await callApi(`/api/file/meta?path=${encodeURIComponent(currentFile.path)}&_t=${Date.now()}`);
-    if (meta && !meta.error) {
+    if (meta && meta.exists === false) {
+      showMissingFileState(currentFile.path, meta.candidates || []);
+      return;
+    }
+    if (meta && meta.exists) {
       currentFile.size = meta.size;
       currentFile.mtime = meta.mtime;
+    }
+    const ws = await callApi(`/api/file/watch-state?path=${encodeURIComponent(currentFile.path)}&_t=${Date.now()}`);
+    if (ws && typeof ws.version === 'number') {
+      currentFile.watchVersion = ws.version;
     }
   } catch (err) {
     console.warn('[reloadCurrentDocument] meta fetch notice:', err);
   }
-  await loadFile(currentFile);
+
+  await loadFile(currentFile, { preserveViewState });
   if (showToastNotice) {
-    toast(`已重新载入最新文档`, 'success');
+    toast('已重新载入最新文档', 'success');
   }
 }
 
 // ---------------------------------------------------------------------------
-// Smart On-Demand Modification Checker & Adaptive Heartbeat
+// Adaptive File Change Watcher (Powered by Backend fs.watch + watch-state)
 // ---------------------------------------------------------------------------
-function notifyUserActivity(doCheckImmediately = true) {
+function markUserActivity() {
   lastActivityTime = Date.now();
-  if (doCheckImmediately) {
-    checkAndReloadIfModified();
-  }
 }
 
 async function checkAndReloadIfModified(force = false) {
-  if (!currentFile || !currentFile.path) return;
+  if (!currentFile || !currentFile.path || currentFile.isMemoryOnly) return;
+  if (!force && document.hidden) return;
+
   const now = Date.now();
-  if (!force && now - lastCheckTime < 600) return; // 节流 600ms
+  if (!force && now - lastCheckTime < 1000) return;
   if (isCheckingModification) return;
 
   lastCheckTime = now;
   isCheckingModification = true;
 
   try {
-    const meta = await callApi(`/api/file/meta?path=${encodeURIComponent(currentFile.path)}&_t=${now}`);
-    if (meta && !meta.error) {
-      const isMtimeChanged = currentFile.mtime && meta.mtime && meta.mtime !== currentFile.mtime;
-      const isSizeChanged = currentFile.size !== undefined && meta.size !== undefined && meta.size !== currentFile.size;
+    const state = await callApi(`/api/file/watch-state?path=${encodeURIComponent(currentFile.path)}&_t=${now}`);
+    if (!state) return;
 
-      if (isMtimeChanged || isSizeChanged) {
-        console.log('[Auto-Reload] 物理文件已更新，自动热重载最新文档:', meta);
-        currentFile.size = meta.size;
-        currentFile.mtime = meta.mtime;
-        await loadFile(currentFile);
-        toast('文档已更新，已自动载入最新内容', 'success');
-      }
+    if (state.exists === false) {
+      const missingPath = currentFile.path;
+      let candidates = [];
+      try {
+        const meta = await callApi(`/api/file/meta?path=${encodeURIComponent(missingPath)}&_t=${now}`);
+        candidates = meta?.candidates || [];
+      } catch {}
+      showMissingFileState(missingPath, candidates);
+      return;
     }
-  } catch (err) {
-    // 忽略静默探测失败
+
+    const versionChanged = typeof state.version === 'number' && state.version !== currentFile.watchVersion;
+    const mtimeChanged = state.mtime && state.mtime !== currentFile.mtime;
+    const sizeChanged = state.size !== undefined && state.size !== currentFile.size;
+
+    if (versionChanged || mtimeChanged || sizeChanged) {
+      const preserveViewState = captureViewState();
+      currentFile.size = state.size;
+      currentFile.mtime = state.mtime;
+      currentFile.watchVersion = state.version ?? currentFile.watchVersion;
+      await loadFile(currentFile, { preserveViewState });
+      toast('文档已更新，已自动载入最新内容', 'success');
+    }
+  } catch {
+    // ignore silent probe failure
   } finally {
     isCheckingModification = false;
   }
 }
 
-// 自适应动态心跳：
-// 1. 文档刚打开或用户刚操作后的前 25 秒（修改高发期）：每 2.5 秒轻量探测一次
-// 2. 25-90 秒（阅读平稳期）：降频至约每 8 秒探测一次
-// 3. 超过 90 秒无操作（静置期）：彻底休眠（0 次网络/IO 请求），完全依靠用户鼠标划入或胶囊点击唤醒
 function startAdaptiveHeartbeat() {
   if (heartbeatTimer) clearInterval(heartbeatTimer);
+  let tick = 0;
   heartbeatTimer = setInterval(() => {
-    if (!currentFile || !currentFile.path) return;
+    if (document.hidden || !currentFile || !currentFile.path || currentFile.isMemoryOnly) return;
+    tick++;
     const idleSeconds = (Date.now() - lastActivityTime) / 1000;
-    if (idleSeconds <= 25) {
+    if (idleSeconds <= 30) {
       checkAndReloadIfModified();
-    } else if (idleSeconds <= 90) {
-      if (Math.floor(idleSeconds) % 8 < 3) {
-        checkAndReloadIfModified();
-      }
+    } else if (tick % 3 === 0) {
+      // Every ~9-10s when reading calmly while visible
+      checkAndReloadIfModified();
     }
-  }, 2500);
+  }, 3000);
 }
-
 
 // ---------------------------------------------------------------------------
 // Load and Render File
 // ---------------------------------------------------------------------------
-async function loadFile(fileInfo) {
+async function loadFile(fileInfo, { preserveViewState = null } = {}) {
   if (!fileInfo || !fileInfo.path) return;
+  const token = ++activeRenderToken;
+
+  cleanupPdfState();
+
   currentFile = fileInfo;
   updateButtonsState(fileInfo);
   updateMetaDisplay(fileInfo);
@@ -259,20 +431,28 @@ async function loadFile(fileInfo) {
   if (ext === '.docx' || ext === '.doc') typeLabel = 'Word 文档';
   else if (ext === '.xlsx' || ext === '.xls' || ext === '.csv') typeLabel = 'Excel 表格';
   else if (ext === '.pdf') typeLabel = 'PDF 文档';
+  else if (ext === '.txt' || ext === '.md' || ext === '.json') typeLabel = '文本预览';
   $('header-status').textContent = typeLabel;
 
   showLoading(`正在载入 ${fileInfo.name}...`);
+
   try {
     if (ext === '.docx') {
-      await renderDocx(fileInfo.path);
+      await renderDocx(fileInfo.path, token, preserveViewState);
     } else if (ext === '.xlsx' || ext === '.xls' || ext === '.csv') {
-      await renderSpreadsheet(fileInfo.path, ext);
+      await renderSpreadsheet(fileInfo.path, ext, token, preserveViewState);
     } else if (ext === '.pdf') {
-      await renderPdf(fileInfo.path);
+      await renderPdf(fileInfo.path, token, preserveViewState);
+    } else if (ext === '.txt' || ext === '.md' || ext === '.json') {
+      await renderTextDocument(fileInfo.path, ext, token, preserveViewState);
     } else {
-      showEmptyState(`暂不支持在侧边栏直接预览 ${ext} 文件，请使用顶部按钮在本地默认程序中打开。`);
+      showEmptyState(
+        `暂不支持在侧边栏直接预览 ${ext} 文件`,
+        '请使用顶部「打开」按钮在本地默认程序中打开。'
+      );
     }
   } catch (err) {
+    if (token !== activeRenderToken) return;
     console.error('[render] Error:', err);
     showEmptyState(`渲染出错: ${err.message}`);
     toast(`渲染失败: ${err.message}`, 'error');
@@ -280,10 +460,10 @@ async function loadFile(fileInfo) {
 }
 
 function updateButtonsState(file) {
-  const hasFile = !!file;
-  $('btn-open-default').disabled = !hasFile;
-  $('btn-reveal').disabled = !hasFile;
-  $('btn-copy-path').disabled = !hasFile;
+  const hasRealPath = !!(file && file.path && !file.isMemoryOnly);
+  $('btn-open-default').disabled = !hasRealPath;
+  $('btn-reveal').disabled = !hasRealPath;
+  $('btn-copy-path').disabled = !hasRealPath;
 
   if (file) {
     const ext = (file.ext || '').toLowerCase();
@@ -292,9 +472,16 @@ function updateButtonsState(file) {
     else if (ext === '.xlsx' || ext === '.xls' || ext === '.csv') label = 'Excel 打开';
     else if (ext === '.pdf') label = 'PDF 打开';
     $('btn-open-label').textContent = label;
-    $('btn-open-default').title = `在系统默认程序中打开：${file.name}`;
-    $('btn-reveal').title = `在资源管理器中定位：${file.name}`;
-    $('btn-copy-path').title = `复制绝对路径：${file.path}`;
+
+    if (hasRealPath) {
+      $('btn-open-default').title = `在系统默认程序中打开：${file.name}`;
+      $('btn-reveal').title = `在资源管理器中定位：${file.name}`;
+      $('btn-copy-path').title = `复制绝对路径：${file.path}`;
+    } else {
+      $('btn-open-default').title = '拖放的内存文件无本地完整路径';
+      $('btn-reveal').title = '拖放的内存文件无本地完整路径';
+      $('btn-copy-path').title = '拖放的内存文件无本地完整路径';
+    }
   } else {
     $('btn-open-label').textContent = '打开';
     $('btn-open-default').title = '在系统默认程序中打开';
@@ -315,12 +502,15 @@ function updateMetaDisplay(file) {
 }
 
 // ---------------------------------------------------------------------------
-// Render Engines
+// 1. DOCX Renderer
 // ---------------------------------------------------------------------------
+async function renderDocx(filePath, token, preserveViewState = null) {
+  await ensureDocxEngine();
+  if (token !== activeRenderToken) return;
 
-// 1. DOCX Renderer (docx-preview with proper inWrapper & Horizontal Full-Width Fit)
-async function renderDocx(filePath) {
   const res = await sidecar.fetch(`/api/file/raw?path=${encodeURIComponent(filePath)}&_t=${Date.now()}`);
+  if (token !== activeRenderToken) return;
+
   if (!res.ok) {
     let errMsg = '无法读取文件内容 (文件可能不存在或无法访问)';
     try {
@@ -330,6 +520,14 @@ async function renderDocx(filePath) {
     throw new Error(errMsg);
   }
   const arrayBuffer = await res.arrayBuffer();
+  if (token !== activeRenderToken) return;
+
+  await mountDocxBuffer(arrayBuffer, token, preserveViewState);
+}
+
+async function mountDocxBuffer(arrayBuffer, token, preserveViewState = null) {
+  await ensureDocxEngine();
+  if (token !== activeRenderToken) return;
 
   hideAllViewports();
   $('docx-wrapper').style.display = 'flex';
@@ -338,181 +536,157 @@ async function renderDocx(filePath) {
   const container = $('docx-render-target');
   container.innerHTML = '';
 
-  if (window.docx && window.docx.renderAsync) {
-    // 关键：ignoreHeight: true 保证页面高度随正文段落自然伸展，杜绝半截白底和后续文字掉落
-    await window.docx.renderAsync(arrayBuffer, container, null, {
-      inWrapper: true,
-      ignoreWidth: false,
-      ignoreHeight: true,
-      renderHeaders: true,
-      renderFooters: true,
-      renderFootnotes: true,
-      renderEndnotes: true,
-      useBase64URL: true,
-      experimental: true,
-    });
+  await window.docx.renderAsync(arrayBuffer, container, null, {
+    inWrapper: true,
+    ignoreWidth: false,
+    ignoreHeight: true,
+    renderHeaders: true,
+    renderFooters: true,
+    renderFootnotes: true,
+    renderEndnotes: true,
+    useBase64URL: true,
+    experimental: true,
+  });
 
-    // 智能修正国标公文落款缩进与中心对齐（GB/T 9704-2012）
-    fixDocxSignatures(container);
+  if (token !== activeRenderToken) return;
 
-    // 测量未缩放状态下的自然物理宽度
-    const section = container.querySelector('section.docx');
-    if (section) {
-      currentDocNaturalWidth = section.offsetWidth || 816;
-    } else {
-      currentDocNaturalWidth = 816;
-    }
+  // Single-pass conservative signature alignment (never touches tables/headers/footers/body)
+  fixDocxSignatures(container);
 
-    // 默认开启横向排满，多层渲染帧兜底保证视口宽度测量 100% 准确
+  const section = container.querySelector('section.docx');
+  currentDocNaturalWidth = section ? (section.offsetWidth || 816) : 816;
+
+  if (preserveViewState && !preserveViewState.isAutoFit && preserveViewState.scale > 0) {
+    isAutoFit = false;
+    applyDocxZoom(clampScale(preserveViewState.scale));
+  } else {
     isAutoFit = true;
     requestAnimationFrame(() => {
-      fixDocxSignatures(container);
+      if (token !== activeRenderToken) return;
       fitDocxToWidth();
-      setTimeout(() => {
-        fixDocxSignatures(container);
-        if (isAutoFit) fitDocxToWidth();
-      }, 100);
     });
+  }
+
+  if (preserveViewState) {
+    restoreScrollPosition($('viewport-container'), preserveViewState);
   } else {
-    throw new Error('docx-preview 引擎未就绪');
+    $('viewport-container').scrollTop = 0;
   }
 }
 
-// ---------------------------------------------------------------------------
-// Standard Government Signature Post-Processor (GB/T 9704-2012 Compliance)
-// ---------------------------------------------------------------------------
+// Conservative Government Signature Post-Processor (GB/T 9704-2012)
 function fixDocxSignatures(container) {
   if (!container) return;
-  const paragraphs = Array.from(container.querySelectorAll('section.docx p, .docx-wrapper p, p'));
-  if (paragraphs.length === 0) return;
+  const bodyRoot = container.querySelector('section.docx > article') || container.querySelector('section.docx') || container;
 
-  // 正则：成文日期格式（支持阿拉伯数字、大写汉字、零/〇等全角半角）
+  // Exclude paragraphs inside tables, headers, footers, or lists
+  const allEligible = Array.from(bodyRoot.querySelectorAll('p')).filter(
+    (p) => !p.closest('table, header, footer, li')
+  );
+  if (allEligible.length === 0) return;
+
+  // Only inspect the trailing tail of the document (last 15 non-empty paragraphs)
+  const nonEmptyTail = allEligible
+    .filter((p) => (p.textContent || '').replace(/[\s\u3000\u00a0]+/g, '').length > 0)
+    .slice(-15);
+
   const dateRegex = /^[〇一二三四五六七八九十零0-9]{4}\s*年\s*[一二三四五六七八九十0-9]{1,2}\s*月\s*[一二三四五六七八九十0-9]{1,2}\s*日$/;
-  // 机构/落款关键词常见结尾
+  const sentencePunctRegex = /[，。、；：？！,.;:?!]/;
   const orgSuffixRegex = /(?:公司|党委|办公室|纪委|工会|委员会|支部|部门|部|处|科|局|组|团委|支公司|分公司|中心)$/;
 
-  for (let i = 0; i < paragraphs.length; i++) {
-    const p = paragraphs[i];
+  for (let i = nonEmptyTail.length - 1; i >= 0; i--) {
+    const p = nonEmptyTail[i];
     if (p.classList.contains('gov-signature-line')) continue;
 
     const rawText = (p.innerText || p.textContent || '').trim();
+    if (sentencePunctRegex.test(rawText)) continue;
+
     const cleanText = rawText.replace(/[\s\t\u3000\u00a0]+/g, '');
+    if (!dateRegex.test(cleanText)) continue;
 
-    if (dateRegex.test(cleanText)) {
-      // 找到了成文日期段落！向上回溯收集落款组（发文机关/部门署名）
-      const sigGroup = [p];
-      let j = i - 1;
-      while (j >= 0 && sigGroup.length < 5) {
-        const prevP = paragraphs[j];
-        if (prevP.classList.contains('gov-signature-line')) break;
-        const prevText = (prevP.innerText || prevP.textContent || '').trim();
-        const prevClean = prevText.replace(/[\s\t\u3000\u00a0]+/g, '');
+    const sigGroup = [p];
+    let j = i - 1;
+    while (j >= 0 && sigGroup.length < 4) {
+      const prevP = nonEmptyTail[j];
+      if (prevP.classList.contains('gov-signature-line')) break;
 
-        if (!prevClean) {
-          j--;
-          continue;
-        }
+      const prevRaw = (prevP.innerText || prevP.textContent || '').trim();
+      const prevClean = prevRaw.replace(/[\s\t\u3000\u00a0]+/g, '');
 
-        // 遇到附件或标题或长正文，停止回溯
-        if (prevClean.startsWith('附件') || prevClean.includes('附件：') || prevClean.includes('附件:')) {
-          break;
-        }
-
-        const hasTab = prevText.includes('\t') || !!prevP.querySelector('.docx-tab-stop');
-        const isOrgLike = prevClean.length <= 35 && (orgSuffixRegex.test(prevClean) || hasTab);
-
-        if (isOrgLike || (hasTab && prevClean.length <= 40)) {
-          sigGroup.unshift(prevP);
-          j--;
-        } else {
-          break;
-        }
+      if (
+        !prevClean ||
+        prevClean.length > 35 ||
+        /[。？！；：?!;:]/.test(prevRaw) ||
+        prevClean.startsWith('附件') ||
+        prevClean.includes('附件：') ||
+        prevClean.includes('附件:')
+      ) {
+        break;
       }
 
-      // 计算这一组落款中最长一行的视觉字符宽度（汉字算1，非汉字算0.55）
-      let maxVisualWidth = 0;
-      const groupData = sigGroup.map((sigP) => {
-        const text = (sigP.innerText || sigP.textContent || '').replace(/[\t\r\n]+/g, '').trim();
-        let w = 0;
-        for (const char of text) {
-          w += char.charCodeAt(0) > 255 ? 1 : 0.55;
-        }
-        if (w > maxVisualWidth) maxVisualWidth = w;
-        return { p: sigP, text, visualWidth: w };
-      });
-
-      if (maxVisualWidth >= 2) {
-        const targetWidthEm = Math.ceil(maxVisualWidth) + 0.5;
-        groupData.forEach(({ p: sigP, text }) => {
-          sigP.classList.add('gov-signature-line');
-          sigP.style.setProperty('text-align', 'right', 'important');
-          sigP.style.setProperty('padding-right', '4em', 'important'); // 国标GB/T 9704-2012：右空四字
-          sigP.style.setProperty('margin-left', '0', 'important');
-          sigP.style.setProperty('text-indent', '0', 'important');
-          sigP.style.setProperty('white-space', 'nowrap', 'important');
-
-          // 构建居中包裹容器
-          const block = document.createElement('span');
-          block.className = 'gov-signature-block';
-          block.style.setProperty('display', 'inline-block', 'important');
-          block.style.setProperty('min-width', `${targetWidthEm}em`, 'important');
-          block.style.setProperty('text-align', 'center', 'important');
-          block.style.setProperty('white-space', 'nowrap', 'important');
-
-          // 收集内部子节点，去除多余制表符与前导空白
-          const validNodes = [];
-          Array.from(sigP.childNodes).forEach((node) => {
-            if (node.nodeType === Node.ELEMENT_NODE) {
-              if (node.classList.contains('docx-tab-stop') || node.innerHTML === '&emsp;' || node.textContent === '\t') {
-                return;
-              }
-            } else if (node.nodeType === Node.TEXT_NODE) {
-              if (node.textContent.trim() === '') return;
-              node.textContent = node.textContent.replace(/^[\t\s]+/, '');
-            }
-            validNodes.push(node);
-          });
-
-          sigP.innerHTML = '';
-          if (validNodes.length > 0) {
-            validNodes.forEach((n) => block.appendChild(n));
-          } else {
-            block.textContent = text;
-          }
-          sigP.appendChild(block);
-        });
+      const hasTab = prevRaw.includes('\t') || !!prevP.querySelector('.docx-tab-stop');
+      if (orgSuffixRegex.test(prevClean) || (hasTab && prevClean.length <= 35)) {
+        sigGroup.unshift(prevP);
+        j--;
+      } else {
+        break;
       }
     }
-  }
 
-  // 补充扫描：仅有发文机关而无日期的单独落款行（以较多空格/制表符开头且以常见机构结尾）
-  for (let i = 0; i < paragraphs.length; i++) {
-    const p = paragraphs[i];
-    if (p.classList.contains('gov-signature-line')) continue;
-    const raw = (p.innerText || p.textContent || '');
-    if ((/^[\t\s\u3000\u00a0]{4,}/.test(raw) || p.querySelector('.docx-tab-stop')) && raw.trim().length <= 30) {
-      const clean = raw.trim().replace(/[\s\t\u3000\u00a0]+/g, '');
-      if (orgSuffixRegex.test(clean)) {
-        p.classList.add('gov-signature-line');
-        p.style.setProperty('text-align', 'right', 'important');
-        p.style.setProperty('padding-right', '4em', 'important');
-        p.style.setProperty('margin-left', '0', 'important');
-        p.style.setProperty('text-indent', '0', 'important');
-        p.style.setProperty('white-space', 'nowrap', 'important');
+    let maxVisualWidth = 0;
+    const groupData = sigGroup.map((sigP) => {
+      const text = (sigP.innerText || sigP.textContent || '').replace(/[\t\r\n]+/g, '').trim();
+      let w = 0;
+      for (const char of text) {
+        w += char.charCodeAt(0) > 255 ? 1 : 0.55;
+      }
+      if (w > maxVisualWidth) maxVisualWidth = w;
+      return { p: sigP, text };
+    });
+
+    if (maxVisualWidth >= 2) {
+      const targetWidthEm = Math.ceil(maxVisualWidth) + 0.5;
+      groupData.forEach(({ p: sigP, text }) => {
+        sigP.classList.add('gov-signature-line');
+        sigP.style.setProperty('text-align', 'right', 'important');
+        sigP.style.setProperty('padding-right', '4em', 'important');
+        sigP.style.setProperty('margin-left', '0', 'important');
+        sigP.style.setProperty('text-indent', '0', 'important');
 
         const block = document.createElement('span');
         block.className = 'gov-signature-block';
         block.style.setProperty('display', 'inline-block', 'important');
+        block.style.setProperty('min-width', `${targetWidthEm}em`, 'important');
         block.style.setProperty('text-align', 'center', 'important');
-        block.textContent = raw.trim();
-        p.innerHTML = '';
-        p.appendChild(block);
-      }
+
+        const validNodes = [];
+        Array.from(sigP.childNodes).forEach((node) => {
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            if (node.classList.contains('docx-tab-stop') || node.innerHTML === '&emsp;' || node.textContent === '\t') {
+              return;
+            }
+          } else if (node.nodeType === Node.TEXT_NODE) {
+            if (node.textContent.trim() === '') return;
+            node.textContent = node.textContent.replace(/^[\t\s]+/, '');
+          }
+          validNodes.push(node);
+        });
+
+        sigP.innerHTML = '';
+        if (validNodes.length > 0) {
+          validNodes.forEach((n) => block.appendChild(n));
+        } else {
+          block.textContent = text;
+        }
+        sigP.appendChild(block);
+      });
     }
+
+    // Process only the final signature block at the end of the document
+    break;
   }
 }
 
-// Fit docx to viewport width (严格按横向排满设置比例)
 function fitDocxToWidth() {
   const container = $('docx-render-target');
   const section = container.querySelector('section.docx');
@@ -521,7 +695,6 @@ function fitDocxToWidth() {
 
   const innerWrapper = container.querySelector('.docx-wrapper') || container;
 
-  // 获得文档未缩放时的自然宽度
   if (!currentDocNaturalWidth || currentDocNaturalWidth <= 0) {
     const prevZoom = innerWrapper.style.zoom;
     innerWrapper.style.zoom = '1';
@@ -529,126 +702,153 @@ function fitDocxToWidth() {
     if (prevZoom) innerWrapper.style.zoom = prevZoom;
   }
 
-  // viewport.clientWidth 扣除纵向滚动条后的纯可用宽度
   const availableWidth = viewport.clientWidth;
-
-  if (docWidthAvailable(availableWidth, currentDocNaturalWidth)) {
-    const scale = availableWidth / currentDocNaturalWidth;
-    applyDocxZoom(scale);
+  if (availableWidth > 0 && currentDocNaturalWidth > 0) {
+    applyDocxZoom(clampScale(availableWidth / currentDocNaturalWidth));
     isAutoFit = true;
   }
 }
 
-function docWidthAvailable(w, nat) {
-  return w > 0 && nat > 0;
-}
-
 function applyDocxZoom(scale) {
-  currentZoom = Math.round(scale * 100);
+  const safeScale = clampScale(scale);
+  currentZoom = Math.round(safeScale * 100);
   $('zoom-label').textContent = `${currentZoom}%`;
 
   const container = $('docx-render-target');
   const innerWrapper = container.querySelector('.docx-wrapper') || container;
 
   if ('zoom' in innerWrapper.style) {
-    innerWrapper.style.zoom = scale;
+    innerWrapper.style.zoom = safeScale;
   } else {
-    innerWrapper.style.transform = `scale(${scale})`;
+    innerWrapper.style.transform = `scale(${safeScale})`;
     innerWrapper.style.transformOrigin = 'top center';
   }
 }
 
-// 2. Spreadsheet Renderer (Backend Lossless CJK HTML Stream + Fallback)
-let currentSheetsMap = {};
-
-async function renderSpreadsheet(filePath, ext) {
-  hideAllViewports();
-  showLoading(`正在载入表格 ${currentFile ? currentFile.name : ''}...`);
-
+// ---------------------------------------------------------------------------
+// 2. Spreadsheet Renderer (Backend Lossless + Client Fallback + Sticky Header)
+// ---------------------------------------------------------------------------
+async function renderSpreadsheet(filePath, ext, token, preserveViewState = null) {
   try {
-    // 优先调用后端高保真无损解析 API（由 Node.js 服务端完成 CJK/CP936 解码，100% 杜绝浏览器 latin1 乱码）
     const res = await callApi(`/api/file/spreadsheet?path=${encodeURIComponent(filePath)}&_t=${Date.now()}`);
+    if (token !== activeRenderToken) return;
+
     if (!res || !res.ok) {
       throw new Error((res && res.error) || '服务端解析表格失败');
     }
 
-    hideAllViewports();
-    $('xlsx-wrapper').style.display = 'flex';
-    $('zoom-controls').style.display = 'none';
-
-    const sheetNames = res.sheetNames || [];
-    if (sheetNames.length === 0) {
-      $('xlsx-table-wrapper').innerHTML = '<div style="padding:20px;text-align:center;">工作簿为空</div>';
-      return;
-    }
-
-    currentSheetsMap = res.sheets || {};
-
-    const tabsContainer = $('sheet-tabs');
-    tabsContainer.innerHTML = '';
-    sheetNames.forEach((name, idx) => {
-      const tab = document.createElement('div');
-      tab.className = `sheet-tab ${idx === 0 ? 'active' : ''}`;
-      tab.textContent = name;
-      tab.addEventListener('click', () => {
-        document.querySelectorAll('.sheet-tab').forEach((t) => t.classList.remove('active'));
-        tab.classList.add('active');
-        renderSheetTable(name);
-      });
-      tabsContainer.appendChild(tab);
-    });
-
-    renderSheetTable(sheetNames[0]);
+    mountSpreadsheetView(
+      res.sheetNames || [],
+      res.sheets || {},
+      preserveViewState?.activeSheetName || null,
+      preserveViewState
+    );
   } catch (backendErr) {
+    if (token !== activeRenderToken) return;
     console.warn('[renderSpreadsheet] Backend parse failed, trying client fallback:', backendErr);
-    // 降级使用前端本地 SheetJS
-    try {
-      const rawRes = await sidecar.fetch(`/api/file/raw?path=${encodeURIComponent(filePath)}&_t=${Date.now()}`);
-      if (!rawRes.ok) throw new Error('无法读取表格原始数据');
-      const arrayBuffer = await rawRes.arrayBuffer();
 
-      hideAllViewports();
-      $('xlsx-wrapper').style.display = 'flex';
-      $('zoom-controls').style.display = 'none';
+    await ensureXlsxEngine();
+    if (token !== activeRenderToken) return;
 
-      if (!window.XLSX) throw new Error('XLSX 引擎未就绪');
-      const data = new Uint8Array(arrayBuffer);
-      currentWorkbook = window.XLSX.read(data, { type: 'array' });
-      const sheetNames = currentWorkbook.SheetNames || [];
-      if (sheetNames.length === 0) {
-        $('xlsx-table-wrapper').innerHTML = '<div style="padding:20px;text-align:center;">工作簿为空</div>';
-        return;
-      }
+    const rawRes = await sidecar.fetch(`/api/file/raw?path=${encodeURIComponent(filePath)}&_t=${Date.now()}`);
+    if (token !== activeRenderToken) return;
+    if (!rawRes.ok) throw new Error('无法读取表格原始数据');
 
-      currentSheetsMap = {};
-      for (const sname of sheetNames) {
-        currentSheetsMap[sname] = window.XLSX.utils.sheet_to_html(currentWorkbook.Sheets[sname], {
-          id: 'sheet-table',
-          editable: false,
-        });
-      }
+    const arrayBuffer = await rawRes.arrayBuffer();
+    if (token !== activeRenderToken) return;
 
-      const tabsContainer = $('sheet-tabs');
-      tabsContainer.innerHTML = '';
-      sheetNames.forEach((name, idx) => {
-        const tab = document.createElement('div');
-        tab.className = `sheet-tab ${idx === 0 ? 'active' : ''}`;
-        tab.textContent = name;
-        tab.addEventListener('click', () => {
-          document.querySelectorAll('.sheet-tab').forEach((t) => t.classList.remove('active'));
-          tab.classList.add('active');
-          renderSheetTable(name);
-        });
-        tabsContainer.appendChild(tab);
+    const wb = ext === '.csv'
+      ? window.XLSX.read(decodeTextBuffer(arrayBuffer), { type: 'string' })
+      : window.XLSX.read(new Uint8Array(arrayBuffer), { type: 'array' });
+
+    const { sheetNames, sheetsMap } = extractSheetsMapFromWorkbook(wb);
+    mountSpreadsheetView(sheetNames, sheetsMap, preserveViewState?.activeSheetName || null, preserveViewState);
+  }
+}
+
+function extractSheetsMapFromWorkbook(wb) {
+  const sheetNames = wb.SheetNames || [];
+  const sheetsMap = {};
+  for (const sname of sheetNames) {
+    const ws = wb.Sheets[sname];
+    if (ws) {
+      sheetsMap[sname] = window.XLSX.utils.sheet_to_html(ws, {
+        header: '',
+        footer: '',
+        id: 'sheet-table',
+        editable: false,
       });
-
-      renderSheetTable(sheetNames[0]);
-    } catch (clientErr) {
-      console.error('[renderSpreadsheet] Fallback failed:', clientErr);
-      showEmptyState(`表格解析失败: ${backendErr.message}`);
-      toast(`表格解析失败: ${backendErr.message}`, 'error');
     }
   }
+  return { sheetNames, sheetsMap };
+}
+
+function mountSpreadsheetView(sheetNames, sheetsMap, preferredSheetName = null, preserveViewState = null) {
+  hideAllViewports();
+  $('xlsx-wrapper').style.display = 'flex';
+  $('zoom-controls').style.display = 'none';
+
+  const tabsContainer = $('sheet-tabs');
+  tabsContainer.innerHTML = '';
+
+  if (!sheetNames || sheetNames.length === 0) {
+    currentSheetsMap = {};
+    activeSheetName = null;
+    $('xlsx-table-wrapper').innerHTML = '<div style="padding:20px;text-align:center;">工作簿为空</div>';
+    return;
+  }
+
+  currentSheetsMap = sheetsMap || {};
+  const targetSheet = (preferredSheetName && sheetNames.includes(preferredSheetName))
+    ? preferredSheetName
+    : sheetNames[0];
+
+  sheetNames.forEach((name) => {
+    const tab = document.createElement('div');
+    tab.className = `sheet-tab ${name === targetSheet ? 'active' : ''}`;
+    tab.textContent = name;
+    tab.addEventListener('click', () => {
+      tabsContainer.querySelectorAll('.sheet-tab').forEach((t) => t.classList.remove('active'));
+      tab.classList.add('active');
+      renderSheetTable(name);
+    });
+    tabsContainer.appendChild(tab);
+  });
+
+  renderSheetTable(targetSheet);
+
+  if (preserveViewState) {
+    restoreScrollPosition($('xlsx-table-wrapper'), preserveViewState);
+  }
+}
+
+function promoteFirstRowToThead(table) {
+  if (!table) return;
+  if (table.querySelector('thead th')) return;
+
+  const firstRow = table.querySelector('tbody tr') || table.querySelector('tr');
+  if (!firstRow || firstRow.children.length === 0) return;
+
+  const thead = document.createElement('thead');
+  const headerTr = document.createElement('tr');
+  for (const attr of firstRow.attributes) {
+    headerTr.setAttribute(attr.name, attr.value);
+  }
+
+  Array.from(firstRow.children).forEach((cell) => {
+    const th = document.createElement('th');
+    for (const attr of cell.attributes) {
+      th.setAttribute(attr.name, attr.value);
+    }
+    while (cell.firstChild) {
+      th.appendChild(cell.firstChild);
+    }
+    headerTr.appendChild(th);
+  });
+
+  thead.appendChild(headerTr);
+  firstRow.remove();
+  table.insertBefore(thead, table.firstChild);
 }
 
 function renderSheetTable(sheetName) {
@@ -659,62 +859,76 @@ function renderSheetTable(sheetName) {
   const table = tableContainer.querySelector('table');
   if (table) {
     table.className = 'sheet-table';
+    promoteFirstRowToThead(table);
     table.querySelectorAll('td').forEach((td) => {
       if (td.textContent.includes('\n') || td.textContent.length > 40) {
         td.classList.add('multiline-cell');
       }
     });
   }
+  tableContainer.scrollTop = 0;
+  tableContainer.scrollLeft = 0;
 }
 
-// 3. PDF Renderer (Mozilla PDF.js Offline High-DPI Multi-Page Canvas Stream)
-async function ensurePdfEngine() {
-  if (window.pdfjsLib) return;
-  for (let i = 0; i < 6; i++) {
-    if (window.pdfjsLib) return;
-    await new Promise((r) => setTimeout(r, 60));
+// ---------------------------------------------------------------------------
+// 3. PDF Renderer (Offline CMap + IntersectionObserver Lazy + TextLayer + Sharp Zoom)
+// ---------------------------------------------------------------------------
+class SidecarCMapReaderFactory {
+  constructor({ baseUrl = '/api/vendor/cmap?file=', isCompressed = true } = {}) {
+    this.baseUrl = baseUrl || '/api/vendor/cmap?file=';
+    this.isCompressed = isCompressed;
   }
-  if (window.pdfjsLib) return;
 
-  try {
-    const r1 = await sidecar.fetch('/vendor/pdf.min.js').catch(() => null);
-    if (r1 && r1.ok) {
-      const scriptText = await r1.text();
-      const script = document.createElement('script');
-      script.textContent = scriptText;
-      document.head.appendChild(script);
-      await new Promise((r) => setTimeout(r, 80));
+  async fetch({ name }) {
+    if (!name) throw new Error('CMap name must be specified.');
+    const fileName = `${name}${this.isCompressed ? '.bcmap' : ''}`;
+    const res = await sidecar.fetch(`${this.baseUrl}${encodeURIComponent(fileName)}`);
+    if (!res.ok) {
+      throw new Error(`Unable to load CMap: ${fileName} (${res.status})`);
     }
-  } catch (err) {
-    console.error('[PDF.js] Dynamic engine load error:', err);
-  }
-
-  if (!window.pdfjsLib) {
-    throw new Error('PDF 离线引擎 (pdf.min.js) 尚未完成加载');
+    const buf = await res.arrayBuffer();
+    return {
+      cMapData: new Uint8Array(buf),
+      compressionType: this.isCompressed
+        ? (window.pdfjsLib?.CMapCompressionType?.BINARY ?? 1)
+        : (window.pdfjsLib?.CMapCompressionType?.NONE ?? 0),
+    };
   }
 }
 
-async function ensurePdfWorker() {
-  if (!window.pdfjsLib) return;
-  if (pdfjsLib.GlobalWorkerOptions.workerPort || pdfjsLib.GlobalWorkerOptions.workerSrc) return;
+function cleanupPdfState() {
+  if (pdfState.zoomDebounceTimer) {
+    clearTimeout(pdfState.zoomDebounceTimer);
+    pdfState.zoomDebounceTimer = null;
+  }
+  if (pdfState.observer) {
+    pdfState.observer.disconnect();
+    pdfState.observer = null;
+  }
+  for (const meta of pdfState.pages) {
+    try { meta.renderTask?.cancel?.(); } catch {}
+    try { meta.textTask?.cancel?.(); } catch {}
+  }
+  pdfState.pages = [];
+  pdfState.visiblePages.clear();
 
-  try {
-    const testR = await sidecar.fetch('/vendor/pdf.worker.min.js').catch(() => null);
-    if (testR && testR.ok) {
-      pdfjsLib.GlobalWorkerOptions.workerSrc = '/vendor/pdf.worker.min.js';
-      return;
-    }
-  } catch {}
+  if (pdfState.doc) {
+    const oldDoc = pdfState.doc;
+    pdfState.doc = null;
+    oldDoc.destroy().catch(() => {});
+  }
+
+  const container = $('pdf-pages-container');
+  if (container) container.innerHTML = '';
 }
 
-async function renderPdf(filePath) {
-  hideAllViewports();
-  showLoading(`正在载入 PDF ${currentFile ? currentFile.name : ''}...`);
-
+async function renderPdf(filePath, token, preserveViewState = null) {
   await ensurePdfEngine();
-  await ensurePdfWorker();
+  if (token !== activeRenderToken) return;
 
   const res = await sidecar.fetch(`/api/file/raw?path=${encodeURIComponent(filePath)}&_t=${Date.now()}`);
+  if (token !== activeRenderToken) return;
+
   if (!res.ok) {
     let errMsg = '无法读取 PDF 文件数据 (文件可能不存在或无法访问)';
     try {
@@ -724,14 +938,29 @@ async function renderPdf(filePath) {
     throw new Error(errMsg);
   }
   const arrayBuffer = await res.arrayBuffer();
+  if (token !== activeRenderToken) return;
 
-  const loadingTask = pdfjsLib.getDocument({
+  await mountPdfBuffer(arrayBuffer, token, preserveViewState);
+}
+
+async function mountPdfBuffer(arrayBuffer, token, preserveViewState = null) {
+  await ensurePdfEngine();
+  if (token !== activeRenderToken) return;
+
+  const loadingTask = window.pdfjsLib.getDocument({
     data: arrayBuffer,
+    cMapUrl: '/api/vendor/cmap?file=',
     cMapPacked: true,
+    CMapReaderFactory: SidecarCMapReaderFactory,
   });
 
   const pdfDoc = await loadingTask.promise;
-  currentPdfDoc = pdfDoc;
+  if (token !== activeRenderToken) {
+    pdfDoc.destroy().catch(() => {});
+    return;
+  }
+
+  pdfState.doc = pdfDoc;
   const numPages = pdfDoc.numPages;
 
   hideAllViewports();
@@ -740,105 +969,357 @@ async function renderPdf(filePath) {
 
   const container = $('pdf-pages-container');
   container.innerHTML = '';
+  container.style.zoom = '';
+  container.style.transform = '';
 
   const firstPage = await pdfDoc.getPage(1);
-  const baseViewport = firstPage.getViewport({ scale: 1.0 });
-  currentPdfNaturalWidth = baseViewport.width || 595;
+  if (token !== activeRenderToken) return;
 
-  const dpr = window.devicePixelRatio || 1;
-  const renderScale = Math.max(1.5, Math.min(2.5, dpr * 1.25));
+  const firstViewport = firstPage.getViewport({ scale: 1.0 });
+  currentPdfNaturalWidth = firstViewport.width || 595;
 
+  const pdfWrapper = $('pdf-wrapper');
+  const availableWidth = (pdfWrapper.clientWidth || $('viewport-container').clientWidth) - 24;
+
+  let initialScale = 1.0;
+  if (preserveViewState && !preserveViewState.isAutoFit && preserveViewState.scale > 0) {
+    isAutoFit = false;
+    initialScale = clampScale(preserveViewState.scale);
+  } else {
+    isAutoFit = true;
+    initialScale = availableWidth > 0 && currentPdfNaturalWidth > 0
+      ? clampScale(availableWidth / currentPdfNaturalWidth)
+      : 1.0;
+  }
+
+  pdfState.scale = initialScale;
+  currentZoom = Math.round(initialScale * 100);
+  $('zoom-label').textContent = `${currentZoom}%`;
+
+  const pages = [];
   for (let pageNum = 1; pageNum <= numPages; pageNum++) {
     const page = pageNum === 1 ? firstPage : await pdfDoc.getPage(pageNum);
-    const pageViewport1x = page.getViewport({ scale: 1.0 });
-    const renderViewport = page.getViewport({ scale: renderScale });
+    if (token !== activeRenderToken) return;
 
-    const pageCard = document.createElement('div');
-    pageCard.className = 'pdf-page-card';
-    pageCard.setAttribute('data-page-number', pageNum);
+    const vp1 = page.getViewport({ scale: 1.0 });
+    const card = document.createElement('div');
+    card.className = 'pdf-page-card';
+    card.setAttribute('data-page-number', String(pageNum));
+    card.style.width = `${Math.max(1, Math.floor(vp1.width * initialScale))}px`;
+    card.style.height = `${Math.max(1, Math.floor(vp1.height * initialScale))}px`;
 
     const canvas = document.createElement('canvas');
     canvas.className = 'pdf-page-canvas';
-    canvas.width = Math.floor(renderViewport.width);
-    canvas.height = Math.floor(renderViewport.height);
-    canvas.style.width = `${Math.floor(pageViewport1x.width)}px`;
-    canvas.style.height = `${Math.floor(pageViewport1x.height)}px`;
-    pageCard.appendChild(canvas);
 
-    const pageBadge = document.createElement('div');
-    pageBadge.className = 'pdf-page-badge';
-    pageBadge.textContent = `${pageNum} / ${numPages}`;
-    pageCard.appendChild(pageBadge);
+    const textLayer = document.createElement('div');
+    textLayer.className = 'textLayer';
 
-    container.appendChild(pageCard);
+    const badge = document.createElement('div');
+    badge.className = 'pdf-page-badge';
+    badge.textContent = `${pageNum} / ${numPages}`;
 
-    const ctx = canvas.getContext('2d');
-    await page.render({
-      canvasContext: ctx,
-      viewport: renderViewport,
-    }).promise;
+    card.appendChild(canvas);
+    card.appendChild(textLayer);
+    card.appendChild(badge);
+    container.appendChild(card);
+
+    pages.push({
+      pageNum,
+      card,
+      canvas,
+      textLayer,
+      baseWidth: vp1.width,
+      baseHeight: vp1.height,
+      renderTask: null,
+      textTask: null,
+      renderedScale: null,
+      renderingScale: null,
+    });
   }
 
-  isAutoFit = true;
-  requestAnimationFrame(() => {
-    fitPdfToWidth();
-    setTimeout(() => {
-      if (isAutoFit) fitPdfToWidth();
-    }, 120);
-  });
+  pdfState.pages = pages;
+
+  if (preserveViewState) {
+    restoreScrollPosition(pdfWrapper, preserveViewState);
+  } else {
+    pdfWrapper.scrollTop = 0;
+  }
+
+  // Lazy-render visible & near-viewport pages via IntersectionObserver
+  const observer = new IntersectionObserver(
+    (entries) => {
+      if (token !== activeRenderToken || !pdfState.doc) return;
+      for (const entry of entries) {
+        const pageNum = Number(entry.target.getAttribute('data-page-number'));
+        if (!pageNum) continue;
+        if (entry.isIntersecting) {
+          pdfState.visiblePages.add(pageNum);
+          const meta = pdfState.pages[pageNum - 1];
+          if (meta) {
+            renderPdfPage(meta, token);
+          }
+        } else {
+          pdfState.visiblePages.delete(pageNum);
+        }
+      }
+    },
+    {
+      root: pdfWrapper,
+      rootMargin: '450px 0px',
+      threshold: 0.01,
+    }
+  );
+
+  pdfState.observer = observer;
+  for (const meta of pages) {
+    observer.observe(meta.card);
+  }
+}
+
+async function renderPdfPage(pageMeta, token) {
+  if (!pageMeta || token !== activeRenderToken || !pdfState.doc) return;
+  const targetScale = pdfState.scale;
+
+  if (pageMeta.renderedScale === targetScale || pageMeta.renderingScale === targetScale) {
+    return;
+  }
+
+  try { pageMeta.renderTask?.cancel?.(); } catch {}
+  try { pageMeta.textTask?.cancel?.(); } catch {}
+
+  pageMeta.renderingScale = targetScale;
+
+  try {
+    const page = await pdfState.doc.getPage(pageMeta.pageNum);
+    if (token !== activeRenderToken || !pdfState.doc || pdfState.scale !== targetScale) return;
+
+    const displayViewport = page.getViewport({ scale: targetScale });
+    const dpr = window.devicePixelRatio || 1;
+    const backingRatio = Math.min(3.0, Math.max(1.25, dpr));
+    const renderViewport = page.getViewport({ scale: targetScale * backingRatio });
+
+    const { canvas, textLayer } = pageMeta;
+    canvas.width = Math.max(1, Math.floor(renderViewport.width));
+    canvas.height = Math.max(1, Math.floor(renderViewport.height));
+
+    const ctx = canvas.getContext('2d');
+    const renderTask = page.render({
+      canvasContext: ctx,
+      viewport: renderViewport,
+    });
+    pageMeta.renderTask = renderTask;
+    await renderTask.promise;
+
+    if (token !== activeRenderToken || !pdfState.doc || pdfState.scale !== targetScale) return;
+
+    textLayer.innerHTML = '';
+    textLayer.style.setProperty('--scale-factor', String(displayViewport.scale));
+    const textTask = window.pdfjsLib.renderTextLayer({
+      textContentSource: page.streamTextContent(),
+      container: textLayer,
+      viewport: displayViewport,
+      textDivs: [],
+    });
+    pageMeta.textTask = textTask;
+    await textTask.promise;
+
+    if (token === activeRenderToken && pdfState.scale === targetScale) {
+      pageMeta.renderedScale = targetScale;
+    }
+  } catch (err) {
+    if (err?.name !== 'RenderingCancelledException') {
+      console.warn(`[PDF] Page ${pageMeta.pageNum} render notice:`, err);
+    }
+  } finally {
+    if (pageMeta.renderingScale === targetScale) {
+      pageMeta.renderingScale = null;
+    }
+  }
 }
 
 function fitPdfToWidth() {
+  const pdfWrapper = $('pdf-wrapper');
   const viewport = $('viewport-container');
-  const container = $('pdf-pages-container');
-  if (!viewport || !container || !currentPdfNaturalWidth) return;
+  const widthSource = (pdfWrapper && pdfWrapper.clientWidth > 0) ? pdfWrapper.clientWidth : viewport?.clientWidth;
+  if (!widthSource || !currentPdfNaturalWidth) return;
 
-  const availableWidth = viewport.clientWidth - 20;
+  const availableWidth = widthSource - 24;
   if (availableWidth > 0 && currentPdfNaturalWidth > 0) {
-    const scale = availableWidth / currentPdfNaturalWidth;
-    applyPdfZoom(scale);
+    applyPdfZoom(clampScale(availableWidth / currentPdfNaturalWidth));
     isAutoFit = true;
   }
 }
 
 function applyPdfZoom(scale) {
-  currentZoom = Math.round(scale * 100);
+  const safeScale = clampScale(scale);
+  if (Math.abs(safeScale - pdfState.scale) < 0.001 && pdfState.pages.length > 0) {
+    currentZoom = Math.round(safeScale * 100);
+    $('zoom-label').textContent = `${currentZoom}%`;
+    return;
+  }
+
+  pdfState.scale = safeScale;
+  currentZoom = Math.round(safeScale * 100);
   $('zoom-label').textContent = `${currentZoom}%`;
 
-  const container = $('pdf-pages-container');
-  if (!container) return;
+  // Immediately resize page cards so layout & existing bitmaps scale without layout jump
+  for (const meta of pdfState.pages) {
+    meta.card.style.width = `${Math.max(1, Math.floor(meta.baseWidth * safeScale))}px`;
+    meta.card.style.height = `${Math.max(1, Math.floor(meta.baseHeight * safeScale))}px`;
+    if (meta.renderedScale !== safeScale) {
+      meta.renderedScale = null;
+    }
+  }
 
-  if ('zoom' in container.style) {
-    container.style.zoom = scale;
+  // Debounce crisp high-DPI re-render of visible + adjacent pages
+  clearTimeout(pdfState.zoomDebounceTimer);
+  const zoomToken = activeRenderToken;
+  pdfState.zoomDebounceTimer = setTimeout(() => {
+    if (zoomToken !== activeRenderToken || !pdfState.doc) return;
+    const targets = new Set(pdfState.visiblePages);
+    for (const p of pdfState.visiblePages) {
+      if (p > 1) targets.add(p - 1);
+      if (p < pdfState.pages.length) targets.add(p + 1);
+    }
+    if (targets.size === 0 && pdfState.pages.length > 0) {
+      targets.add(1);
+    }
+    for (const pageNum of targets) {
+      const meta = pdfState.pages[pageNum - 1];
+      if (meta) renderPdfPage(meta, zoomToken);
+    }
+  }, 160);
+}
+
+// ---------------------------------------------------------------------------
+// 4. Plain Text / Markdown / JSON Renderer
+// ---------------------------------------------------------------------------
+async function renderTextDocument(filePath, ext, token, preserveViewState = null) {
+  const res = await sidecar.fetch(`/api/file/raw?path=${encodeURIComponent(filePath)}&_t=${Date.now()}`);
+  if (token !== activeRenderToken) return;
+
+  if (!res.ok) {
+    let errMsg = '无法读取文件内容';
+    try {
+      const errJson = await res.json();
+      if (errJson && errJson.error) errMsg = errJson.error;
+    } catch {}
+    throw new Error(errMsg);
+  }
+
+  const arrayBuffer = await res.arrayBuffer();
+  if (token !== activeRenderToken) return;
+
+  mountTextContent(decodeTextBuffer(arrayBuffer), ext, preserveViewState);
+}
+
+function mountTextContent(rawText, ext, preserveViewState = null) {
+  let content = rawText;
+  if (ext === '.json') {
+    try {
+      content = JSON.stringify(JSON.parse(rawText), null, 2);
+    } catch {
+      // Keep original text when invalid JSON
+    }
+  }
+
+  hideAllViewports();
+  $('zoom-controls').style.display = 'none';
+  const tv = $('text-view');
+  tv.style.display = 'block';
+  tv.textContent = content;
+
+  if (preserveViewState) {
+    restoreScrollPosition(tv, preserveViewState);
   } else {
-    container.style.transform = `scale(${scale})`;
-    container.style.transformOrigin = 'top center';
+    tv.scrollTop = 0;
   }
 }
 
 // ---------------------------------------------------------------------------
-// Viewport State Switches
+// Viewport State Switches & Missing File UI
 // ---------------------------------------------------------------------------
 function hideAllViewports() {
   $('empty-state').style.display = 'none';
+  const candEl = $('empty-candidates');
+  if (candEl) {
+    candEl.style.display = 'none';
+    candEl.innerHTML = '';
+  }
   $('loading-state').style.display = 'none';
   $('docx-wrapper').style.display = 'none';
   $('xlsx-wrapper').style.display = 'none';
-  const pdfWrapper = $('pdf-wrapper');
-  if (pdfWrapper) pdfWrapper.style.display = 'none';
-  const pdfIframe = $('pdf-iframe');
-  if (pdfIframe) pdfIframe.style.display = 'none';
+  $('pdf-wrapper').style.display = 'none';
   $('text-view').style.display = 'none';
 }
 
-function showEmptyState(msg) {
+function showEmptyState(title, subtitle = '') {
   hideAllViewports();
   $('empty-state').style.display = 'flex';
   $('zoom-controls').style.display = 'none';
-  if (msg) {
-    const p = $('empty-state').querySelector('p:first-child');
-    if (p) p.textContent = msg;
-  }
+  const titleEl = $('empty-title');
+  const subtitleEl = $('empty-subtitle');
+  if (titleEl) titleEl.textContent = title || '未指定预览文档';
+  if (subtitleEl) subtitleEl.textContent = subtitle || '';
+}
+
+function showMissingFileState(requestedPath, candidates = []) {
+  activeRenderToken++;
+  cleanupPdfState();
+  currentFile = null;
+  updateButtonsState(null);
+  updateMetaDisplay(null);
+  $('header-status').textContent = '文件不存在';
+
+  const fileName = getBaseName(requestedPath) || requestedPath;
+  showEmptyState(
+    `文件不存在：${fileName}`,
+    candidates.length > 0
+      ? '原始路径未找到精确匹配文件，请在下方确认是否为重命名/相邻文件：'
+      : '请确认文件路径是否已被移动、重命名或删除。'
+  );
+
+  const candEl = $('empty-candidates');
+  if (!candEl || !Array.isArray(candidates) || candidates.length === 0) return;
+
+  candEl.innerHTML = '';
+  const header = document.createElement('div');
+  header.className = 'missing-candidates-title';
+  header.textContent = '同目录相似文件（点击打开）：';
+  candEl.appendChild(header);
+
+  candidates.forEach((cand) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'candidate-btn';
+
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'candidate-name';
+    nameSpan.textContent = cand.name;
+    nameSpan.title = cand.path;
+
+    const metaSpan = document.createElement('span');
+    metaSpan.className = 'candidate-meta';
+    const pct = Math.round((cand.similarity || 0) * 100);
+    metaSpan.textContent = `${pct}% · ${formatBytes(cand.size)}`;
+
+    btn.appendChild(nameSpan);
+    btn.appendChild(metaSpan);
+    btn.addEventListener('click', () => {
+      markUserActivity();
+      loadFile({
+        name: cand.name,
+        path: cand.path,
+        ext: cand.ext,
+        size: cand.size,
+        mtime: cand.mtime,
+      });
+    });
+
+    candEl.appendChild(btn);
+  });
+
+  candEl.style.display = 'flex';
 }
 
 function showLoading(msg) {
@@ -852,10 +1333,10 @@ function showLoading(msg) {
 // ---------------------------------------------------------------------------
 function updateZoom(newPercent) {
   isAutoFit = false;
-  const scale = Math.max(0.2, Math.min(3.0, newPercent / 100));
+  const scale = clampScale(newPercent / 100);
   if ($('docx-wrapper').style.display !== 'none') {
     applyDocxZoom(scale);
-  } else if ($('pdf-wrapper') && $('pdf-wrapper').style.display !== 'none') {
+  } else if ($('pdf-wrapper').style.display !== 'none') {
     applyPdfZoom(scale);
   }
 }
@@ -864,7 +1345,7 @@ function resetZoom() {
   isAutoFit = false;
   if ($('docx-wrapper').style.display !== 'none') {
     applyDocxZoom(1.0);
-  } else if ($('pdf-wrapper') && $('pdf-wrapper').style.display !== 'none') {
+  } else if ($('pdf-wrapper').style.display !== 'none') {
     applyPdfZoom(1.0);
   }
 }
@@ -873,16 +1354,16 @@ function fitCurrentToWidth() {
   isAutoFit = true;
   if ($('docx-wrapper').style.display !== 'none') {
     fitDocxToWidth();
-  } else if ($('pdf-wrapper') && $('pdf-wrapper').style.display !== 'none') {
+  } else if ($('pdf-wrapper').style.display !== 'none') {
     fitPdfToWidth();
   }
 }
 
 // ---------------------------------------------------------------------------
-// Native System Actions (P0 - Instant Sub-10ms Silent Dispatch)
+// Native System Actions
 // ---------------------------------------------------------------------------
 async function openInDefaultApp() {
-  if (!currentFile || !currentFile.path) return;
+  if (!currentFile || !currentFile.path || currentFile.isMemoryOnly) return;
   try {
     const res = await callApi('/api/action/open-default', {
       method: 'POST',
@@ -897,7 +1378,7 @@ async function openInDefaultApp() {
 }
 
 async function revealInExplorer() {
-  if (!currentFile || !currentFile.path) return;
+  if (!currentFile || !currentFile.path || currentFile.isMemoryOnly) return;
   try {
     const res = await callApi('/api/action/reveal', {
       method: 'POST',
@@ -911,10 +1392,18 @@ async function revealInExplorer() {
   }
 }
 
-// Robust clipboard copy with fallback to native OS command via sidecar
 async function copyToClipboard(text) {
-  // 1. Try traditional execCommand (bypasses Permissions Policy in iframes)
-  let copied = false;
+  // 1. Modern Clipboard API first
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // Fallback if iframe Permissions-Policy denies Clipboard API
+    }
+  }
+
+  // 2. Legacy execCommand fallback
   try {
     const ta = document.createElement('textarea');
     ta.value = text;
@@ -924,16 +1413,15 @@ async function copyToClipboard(text) {
     ta.setAttribute('readonly', '');
     document.body.appendChild(ta);
     ta.select();
-    ta.setSelectionRange(0, 99999);
-    copied = document.execCommand('copy');
+    ta.setSelectionRange(0, text.length);
+    const copied = document.execCommand('copy');
     document.body.removeChild(ta);
+    if (copied) return true;
   } catch {
-    copied = false;
+    // Fallback to OS command
   }
 
-  if (copied) return true;
-
-  // 2. Fallback to Sidecar backend native OS clipboard API
+  // 3. Sidecar backend OS clipboard API
   try {
     const res = await callApi('/api/action/copy-clipboard', {
       method: 'POST',
@@ -947,17 +1435,17 @@ async function copyToClipboard(text) {
 }
 
 async function copyFilePath() {
-  if (!currentFile || !currentFile.path) return;
+  if (!currentFile || !currentFile.path || currentFile.isMemoryOnly) return;
   const ok = await copyToClipboard(currentFile.path);
   if (ok) {
     toast('文件绝对路径已复制到剪贴板', 'success');
   } else {
-    toast('复制失败，请在上方手动选择路径复制', 'error');
+    toast('复制失败，请检查剪贴板权限', 'error');
   }
 }
 
 // ---------------------------------------------------------------------------
-// Drag and Drop & Manual Path
+// Drag and Drop
 // ---------------------------------------------------------------------------
 function setupDragAndDrop() {
   const overlay = $('drop-overlay');
@@ -981,9 +1469,11 @@ function setupDragAndDrop() {
     if (files && files.length > 0) {
       const file = files[0];
       const name = file.name;
+      const ext = name.includes('.') ? '.' + name.split('.').pop().toLowerCase() : '';
       const localPath = file.path || '';
+      markUserActivity();
+
       if (localPath) {
-        const ext = '.' + name.split('.').pop().toLowerCase();
         loadFile({
           name,
           path: localPath,
@@ -1001,88 +1491,48 @@ function setupDragAndDrop() {
 }
 
 async function renderRawDroppedFile(file) {
-  const ext = '.' + file.name.split('.').pop().toLowerCase();
-  showLoading(`正在读取本地文件 ${file.name}...`);
+  const token = ++activeRenderToken;
+  cleanupPdfState();
+
+  const ext = file.name.includes('.') ? '.' + file.name.split('.').pop().toLowerCase() : '';
   currentFile = {
     name: file.name,
-    path: file.name,
+    path: '',
     size: file.size,
     mtime: file.lastModified,
     ext,
+    isMemoryOnly: true,
   };
-  updateButtonsState(null);
+  updateButtonsState(currentFile);
   updateMetaDisplay(currentFile);
+  $('header-status').textContent = '拖放预览';
+  showLoading(`正在读取本地文件 ${file.name}...`);
 
   try {
     const arrayBuffer = await file.arrayBuffer();
-    if (ext === '.docx') {
-      hideAllViewports();
-      $('docx-wrapper').style.display = 'flex';
-      $('zoom-controls').style.display = 'flex';
-      $('docx-render-target').innerHTML = '';
-      await window.docx.renderAsync(arrayBuffer, $('docx-render-target'), null, {
-        inWrapper: true,
-        ignoreWidth: false,
-        ignoreHeight: true,
-        renderHeaders: true,
-        renderFooters: true,
-      });
-      const sec = $('docx-render-target').querySelector('section.docx');
-      currentDocNaturalWidth = sec ? (sec.offsetWidth || 816) : 816;
-      isAutoFit = true;
-      requestAnimationFrame(() => fitDocxToWidth());
-    } else if (ext === '.xlsx' || ext === '.xls' || ext === '.csv') {
-      hideAllViewports();
-      $('xlsx-wrapper').style.display = 'flex';
-      $('zoom-controls').style.display = 'none';
-      const data = new Uint8Array(arrayBuffer);
-      currentWorkbook = window.XLSX.read(data, { type: 'array' });
-      renderSheetTable(currentWorkbook.SheetNames[0]);
-    } else if (ext === '.pdf') {
-      if (!window.pdfjsLib) throw new Error('PDF 离线引擎未就绪');
-      if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
-        pdfjsLib.GlobalWorkerOptions.workerSrc = '/vendor/pdf.worker.min.js';
-      }
-      const pdfDoc = await pdfjsLib.getDocument({ data: arrayBuffer, cMapPacked: true }).promise;
-      currentPdfDoc = pdfDoc;
-      hideAllViewports();
-      $('pdf-wrapper').style.display = 'flex';
-      $('zoom-controls').style.display = 'flex';
-      const container = $('pdf-pages-container');
-      container.innerHTML = '';
-      const firstPage = await pdfDoc.getPage(1);
-      const baseViewport = firstPage.getViewport({ scale: 1.0 });
-      currentPdfNaturalWidth = baseViewport.width || 595;
-      const dpr = window.devicePixelRatio || 1;
-      const renderScale = Math.max(1.5, Math.min(2.5, dpr * 1.25));
+    if (token !== activeRenderToken) return;
 
-      for (let pageNum = 1; pageNum <= pdfDoc.numPages; pageNum++) {
-        const page = pageNum === 1 ? firstPage : await pdfDoc.getPage(pageNum);
-        const pageViewport1x = page.getViewport({ scale: 1.0 });
-        const renderViewport = page.getViewport({ scale: renderScale });
-        const pageCard = document.createElement('div');
-        pageCard.className = 'pdf-page-card';
-        pageCard.setAttribute('data-page-number', pageNum);
-        const canvas = document.createElement('canvas');
-        canvas.className = 'pdf-page-canvas';
-        canvas.width = Math.floor(renderViewport.width);
-        canvas.height = Math.floor(renderViewport.height);
-        canvas.style.width = `${Math.floor(pageViewport1x.width)}px`;
-        canvas.style.height = `${Math.floor(pageViewport1x.height)}px`;
-        pageCard.appendChild(canvas);
-        const pageBadge = document.createElement('div');
-        pageBadge.className = 'pdf-page-badge';
-        pageBadge.textContent = `${pageNum} / ${pdfDoc.numPages}`;
-        pageCard.appendChild(pageBadge);
-        container.appendChild(pageCard);
-        await page.render({ canvasContext: canvas.getContext('2d'), viewport: renderViewport }).promise;
-      }
-      isAutoFit = true;
-      requestAnimationFrame(() => fitPdfToWidth());
+    if (ext === '.docx') {
+      await mountDocxBuffer(arrayBuffer, token);
+    } else if (ext === '.xlsx' || ext === '.xls' || ext === '.csv') {
+      await ensureXlsxEngine();
+      if (token !== activeRenderToken) return;
+
+      const wb = ext === '.csv'
+        ? window.XLSX.read(decodeTextBuffer(arrayBuffer), { type: 'string' })
+        : window.XLSX.read(new Uint8Array(arrayBuffer), { type: 'array' });
+
+      const { sheetNames, sheetsMap } = extractSheetsMapFromWorkbook(wb);
+      mountSpreadsheetView(sheetNames, sheetsMap);
+    } else if (ext === '.pdf') {
+      await mountPdfBuffer(arrayBuffer, token);
+    } else if (ext === '.txt' || ext === '.md' || ext === '.json') {
+      mountTextContent(decodeTextBuffer(arrayBuffer), ext);
     } else {
-      showEmptyState(`暂不支持直接脱机解析 ${ext}`);
+      showEmptyState(`暂不支持直接脱机解析 ${ext || '该'} 文件`);
     }
   } catch (err) {
+    if (token !== activeRenderToken) return;
     showEmptyState(`解析失败: ${err.message}`);
   }
 }
@@ -1095,67 +1545,67 @@ function initEvents() {
   $('btn-reveal').addEventListener('click', revealInExplorer);
   $('btn-copy-path').addEventListener('click', copyFilePath);
 
-  // Document Reload button (In-place instant silent refresh, never drops host CSS variables)
   const reloadUiBtn = $('btn-reload-ui');
   if (reloadUiBtn) {
     reloadUiBtn.addEventListener('click', async () => {
-      syncAndPreserveTheme();
+      markUserActivity();
       await reloadCurrentDocument(true);
     });
   }
 
-  // Zoom controls
   $('btn-zoom-in').addEventListener('click', () => updateZoom(currentZoom + 10));
   $('btn-zoom-out').addEventListener('click', () => updateZoom(currentZoom - 10));
   $('btn-zoom-reset').addEventListener('click', resetZoom);
-  $('btn-zoom-fit').addEventListener('click', () => {
-    fitCurrentToWidth();
-  });
+  $('btn-zoom-fit').addEventListener('click', fitCurrentToWidth);
+
+  // Ctrl/Cmd + Wheel zoom for DOCX and PDF (plain wheel triggers zero network calls)
+  $('viewport-container').addEventListener('wheel', (e) => {
+    if (e.ctrlKey || e.metaKey) {
+      const isDocx = $('docx-wrapper').style.display !== 'none';
+      const isPdf = $('pdf-wrapper').style.display !== 'none';
+      if (isDocx || isPdf) {
+        e.preventDefault();
+        const step = e.deltaY < 0 ? 10 : -10;
+        updateZoom(currentZoom + step);
+      }
+    }
+  }, { passive: false });
 
   setupDragAndDrop();
 
-  // Watch for dynamic resize of the auxiliary side pane
   if (window.ResizeObserver) {
+    let resizeRaf = null;
     const ro = new ResizeObserver(() => {
-      if (isAutoFit && currentFile) {
+      if (!isAutoFit || !currentFile) return;
+      if (resizeRaf) cancelAnimationFrame(resizeRaf);
+      resizeRaf = requestAnimationFrame(() => {
+        if (!isAutoFit || !currentFile) return;
         if (currentFile.ext === '.docx') {
           fitDocxToWidth();
         } else if (currentFile.ext === '.pdf') {
           fitPdfToWidth();
         }
-      }
+      });
     });
     ro.observe($('viewport-container'));
   }
 
-  // URL query parameter watcher & Window focus trigger (Pill clicks refocus the panel)
   window.addEventListener('popstate', () => syncWithUrl(true));
   window.addEventListener('hashchange', () => syncWithUrl(true));
 
-  // 接收 Antigravity 宿主通过 postMessage 派发的消息
-  window.addEventListener('message', () => {
-    notifyUserActivity(true);
-  });
-
-  // 每次窗口重新获得焦点（例如用户在会话中点击文档胶囊切换过来），强制同步并检查最新文件
   window.addEventListener('focus', () => {
-    syncAndPreserveTheme();
-    notifyUserActivity(true);
+    markUserActivity();
+    checkAndReloadIfModified(true);
   });
 
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
-      syncAndPreserveTheme();
-      notifyUserActivity(true);
+      markUserActivity();
+      checkAndReloadIfModified(true);
     }
   });
 
-  // 鼠标划入或交互感知（用户在左侧点完胶囊，鼠标/目光移向右侧侧边栏即可零等待感知最新文件）
-  ['pointerenter', 'mouseenter', 'pointerdown', 'wheel'].forEach((evt) => {
-    window.addEventListener(evt, () => notifyUserActivity(true), { passive: true });
-  });
-
-  // 高频微秒级 URL search 变动监听（纯本地内存字符串比对，零网络请求、零磁盘IO）
+  // In-memory URL search watcher (zero network or disk I/O)
   setInterval(() => {
     const currentSearch = window.location.search || '';
     if (currentSearch !== lastKnownSearch) {
@@ -1164,7 +1614,6 @@ function initEvents() {
     }
   }, 250);
 
-  // 启动自适应平滑心跳（活跃期 2.5s 探测，静置 90s 后彻底休眠）
   startAdaptiveHeartbeat();
 }
 
@@ -1172,12 +1621,9 @@ function initEvents() {
 // Bootstrap
 // ---------------------------------------------------------------------------
 document.addEventListener('DOMContentLoaded', () => {
-  syncAndPreserveTheme();
   initEvents();
   setTimeout(() => {
-    syncAndPreserveTheme();
     lastKnownSearch = window.location.search || '';
-    lastKnownQueryFile = getUrlFileParam();
     syncWithUrl(true);
   }, 50);
 });
