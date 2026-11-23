@@ -3,6 +3,7 @@
 
 import { existsSync, lstatSync, readdirSync, statSync } from 'node:fs';
 import { basename, dirname, extname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 export const ALLOWED_PREVIEW_EXTS = new Set([
   '.docx',
@@ -326,4 +327,87 @@ export function buildWinRevealArgs(absPath) {
 export function buildWinClipboardArgs(text, exeOverride) {
   const escaped = escapePsSingleQuoted(text);
   return buildWinPsInvocation(`Set-Clipboard -Value '${escaped}'`, exeOverride);
+}
+
+// ---------------------------------------------------------------------------
+// Cross-Platform macOS & Linux Command Builders
+// ---------------------------------------------------------------------------
+export function buildMacUtf8Env(baseEnv = process.env) {
+  const env = { ...baseEnv };
+  const hasUtf8 = [env.LC_ALL, env.LC_CTYPE, env.LANG].some(
+    (val) => typeof val === 'string' && /utf-?8/i.test(val)
+  );
+  if (!hasUtf8) {
+    env.LANG = (baseEnv.LANG && /utf-?8/i.test(baseEnv.LANG)) ? baseEnv.LANG : 'en_US.UTF-8';
+    env.LC_CTYPE = 'UTF-8';
+  }
+  return env;
+}
+
+export function buildMacRevealArgs(absPath) {
+  return {
+    command: 'open',
+    args: ['-R', String(absPath)],
+  };
+}
+
+export function toSafeFileUri(absPath) {
+  const raw = String(absPath || '');
+  const uri = raw.startsWith('/')
+    ? `file://${raw.split('/').map((seg, idx) => (idx === 0 ? '' : encodeURIComponent(seg))).join('/')}`
+    : pathToFileURL(raw).href;
+  return uri.replace(/'/g, '%27');
+}
+
+export function buildLinuxRevealChain(absPath) {
+  const pathStr = String(absPath);
+  const uri = toSafeFileUri(pathStr);
+  return [
+    {
+      command: 'gdbus',
+      args: [
+        'call',
+        '--session',
+        '--dest',
+        'org.freedesktop.FileManager1',
+        '--object-path',
+        '/org/freedesktop/FileManager1',
+        '--method',
+        'org.freedesktop.FileManager1.ShowItems',
+        `['${uri}']`,
+        '',
+      ],
+      mode: 'dbus',
+    },
+    {
+      command: 'dbus-send',
+      args: [
+        '--session',
+        '--print-reply',
+        '--dest=org.freedesktop.FileManager1',
+        '/org/freedesktop/FileManager1',
+        'org.freedesktop.FileManager1.ShowItems',
+        `array:string:${uri}`,
+        'string:',
+      ],
+      mode: 'dbus',
+    },
+    {
+      command: 'xdg-open',
+      args: [dirname(pathStr)],
+      mode: 'fallback-dir',
+    },
+  ];
+}
+
+export function buildLinuxClipboardChain(env = process.env) {
+  const isWayland =
+    Boolean(env.WAYLAND_DISPLAY) ||
+    String(env.XDG_SESSION_TYPE || '').toLowerCase() === 'wayland';
+
+  const wlCopy = { command: 'wl-copy', args: [] };
+  const xclip = { command: 'xclip', args: ['-selection', 'clipboard'] };
+  const xsel = { command: 'xsel', args: ['--clipboard', '--input'] };
+
+  return isWayland ? [wlCopy, xclip, xsel] : [xclip, xsel, wlCopy];
 }

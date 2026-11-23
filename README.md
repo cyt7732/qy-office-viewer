@@ -27,9 +27,12 @@
 - **纯文本与本地拖放直览**：支持 `.txt` / `.md` / `.json` 预览，以及将本地文件直接拖入侧边栏即时预览。
 
 ### 2. 系统本地程序无缝联动
-- **一键本地打开**：非阻塞瞬时唤起 Microsoft Office、WPS Office 或系统默认关联程序（支持 Windows / macOS / Linux）。
-- **文件管理器高亮定位**：在 Windows 资源管理器或 macOS 访达中直接定位并高亮选中目标文件。
-- **路径复制**：内置剪贴板复制及系统原生命令兜底，一键复制物理绝对路径。
+- **一键本地打开**：非阻塞瞬时唤起系统默认程序（Windows `ProcessStartInfo` 唤起 Office / WPS；macOS `open`；Linux `xdg-open`）。
+- **文件管理器高亮定位**：
+  - Windows：直调 `explorer.exe /select,"<path>"` 高亮选中文件；
+  - macOS：通过 `open -R` 在访达（Finder）中定位并高亮选中文件；
+  - Linux：优先通过 Freedesktop D-Bus `org.freedesktop.FileManager1.ShowItems`（`gdbus` / `dbus-send`）在默认文件管理器中高亮选中文件，不支持时自动回退 `xdg-open` 打开所在目录。
+- **路径复制**：优先使用浏览器剪贴板 API，后端按平台自动兜底（Windows `Set-Clipboard`；macOS 强制 UTF-8 环境变量的 `pbcopy`；Linux 按 Wayland/X11 会话自适应 `wl-copy` / `xclip` / `xsel`）。
 
 ### 3. Antigravity Sidecar 胶囊协议与智能热重载
 - **标准胶囊协议**：在 Antigravity 对话中点击以下格式的 Markdown 胶囊即可在辅助侧边栏展开并定位对应文档：
@@ -39,7 +42,7 @@
 - **智能变更监听与保位热重载**：
   - 后端基于 `fs.watch` 监听文件改动并提供内存态 `/api/file/watch-state`，前端温和感知并在文档保存后自动热重载，同时保留滚动位置、工作表标签与缩放状态；
   - 精准路径校验：当目标文件不存在时不再静默替换，而是明确提示并展示同目录相似候选供用户主动点击打开。
-- **按需加载与安全加固**：按文档类型懒加载离线渲染库，Windows 原生打开/剪贴板采用 PowerShell `-EncodedCommand` 参数安全唤起，文件定位直调 `explorer.exe` 原字面参数，静态/文件接口带扩展名白名单校验。
+- **按需加载与安全加固**：按文档类型懒加载离线渲染库；Windows 原生打开/剪贴板采用 PowerShell `-EncodedCommand` 参数安全唤起、文件定位直调 `explorer.exe` 原字面参数，macOS/Linux 采用无 shell 数组传参；静态/文件接口带扩展名白名单校验。
 
 ---
 
@@ -51,6 +54,7 @@ qy-office-viewer/
 ├── CHANGELOG.md                       # 版本发布与变更记录（Release List）
 ├── README.md                          # 项目说明文档
 ├── sync.ps1                           # Windows 本地一键同步部署脚本
+├── sync.sh                            # macOS / Linux 本地一键同步部署脚本
 ├── assets/
 │   └── logo.svg                       # 插件与侧边栏矢量图标
 └── sidecars/
@@ -75,21 +79,32 @@ qy-office-viewer/
 
 ## 安装与部署
 
-插件通过 `%USERPROFILE%\.gemini\config\plugins\qy-office-viewer` 加载，提供两种部署方式：
+插件通过 `~/.gemini/config/plugins/qy-office-viewer`（Windows 为 `%USERPROFILE%\.gemini\config\plugins\qy-office-viewer`）加载，提供软链接与脚本同步两种部署方式：
 
-### 方式一：NTFS Junction 软链接（推荐，开发调试零同步成本）
+### 方式一：目录软链接（推荐，开发调试零同步成本）
 
-```powershell
-New-Item -ItemType Junction `
-  -Path "$env:USERPROFILE\.gemini\config\plugins\qy-office-viewer" `
-  -Target "D:\Project\qy-office-viewer"
-```
+- **Windows（PowerShell）**：
+  ```powershell
+  New-Item -ItemType Junction `
+    -Path "$env:USERPROFILE\.gemini\config\plugins\qy-office-viewer" `
+    -Target "D:\Project\qy-office-viewer"
+  ```
+- **macOS / Linux（Bash / Zsh）**：
+  ```bash
+  mkdir -p ~/.gemini/config/plugins
+  ln -s /path/to/qy-office-viewer ~/.gemini/config/plugins/qy-office-viewer
+  ```
 
 ### 方式二：使用同步脚本复制部署
 
-```powershell
-pwsh -NoProfile -File .\sync.ps1
-```
+- **Windows（PowerShell 7）**：
+  ```powershell
+  pwsh -NoProfile -File .\sync.ps1
+  ```
+- **macOS / Linux（Bash）**：
+  ```bash
+  chmod +x ./sync.sh && ./sync.sh
+  ```
 
 ### 启用步骤
 
@@ -105,6 +120,7 @@ pwsh -NoProfile -File .\sync.ps1
 
 | 版本 | 发布日期 | 核心亮点 |
 | :--- | :--- | :--- |
+| **[v1.2.2](https://github.com/cyt7732/qy-office-viewer/releases/tag/v1.2.2)** | 2026-11-23 | 补齐 macOS（访达高亮、UTF-8 `pbcopy`）与 Linux（D-Bus `FileManager1` 文件高亮回退链、Wayland/X11 剪贴板防挂起）跨平台能力，新增 `sync.sh` 与三端部署文档 |
 | **[v1.2.1](https://github.com/cyt7732/qy-office-viewer/releases/tag/v1.2.1)** | 2026-11-23 | 修复 Windows 无法唤起 WPS/默认程序与资源管理器定位的回归问题，定位改为直调 `explorer.exe` 原字面参数并修复 Store 版 `pwsh` 识别与失败自动回退 |
 | **[v1.2.0](https://github.com/cyt7732/qy-office-viewer/releases/tag/v1.2.0)** | 2026-11-22 | 修复 Word 红头涂黑、静默误匹配、Excel 吸顶与 CSV 编码/拖拽、PDF CMap/懒渲染/划词复制、Windows 特殊字符命令注入、`fs.watch` 保位热重载与按需懒加载 |
 | **[v1.1.0](https://github.com/cyt7732/qy-office-viewer/releases/tag/v1.1.0)** | 2026-11-22 | 新增 PDF.js 离线高清多页渲染、Node 服务端无损 CJK 表格解析、自适应心跳热重载、紧凑顶栏重构与安全脱敏 |

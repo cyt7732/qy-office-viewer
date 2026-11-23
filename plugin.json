@@ -1,7 +1,7 @@
 {
   "name": "qy-office-viewer",
   "displayName": "Office 预览",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Office 文档侧边栏离线预览与本地程序联动（Word / Excel / PDF / 文本）",
   "logo": "assets/logo.svg",
   "repository": "https://github.com/cyt7732/qy-office-viewer"

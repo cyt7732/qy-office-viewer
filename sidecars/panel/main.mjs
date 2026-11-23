@@ -11,6 +11,10 @@ import { execFile, spawn } from 'node:child_process';
 import { Response, SidecarApp } from 'sidecar_sdk';
 import {
   MIME_TYPES,
+  buildLinuxClipboardChain,
+  buildLinuxRevealChain,
+  buildMacRevealArgs,
+  buildMacUtf8Env,
   buildWinClipboardArgs,
   buildWinOpenArgs,
   buildWinRevealArgs,
@@ -131,7 +135,7 @@ app.api('/api/vendor/cmap', async (data) => {
 // ---------------------------------------------------------------------------
 app.api('/api/status', () => ({
   name: 'qy-office-viewer',
-  version: '1.2.1',
+  version: '1.2.2',
   node: process.version,
   platform: `${platform()} ${release()}`,
   uptimeSeconds: Math.round((Date.now() - STARTED_AT) / 1000),
@@ -552,6 +556,137 @@ function runWinPowerShellAction(buildArgsFn, { timeoutMs = 3000 } = {}) {
   return attempt(undefined, true);
 }
 
+function runCommandExpectZero(command, args, { timeoutMs = 2500, env } = {}) {
+  return new Promise((resolveResult) => {
+    let settled = false;
+    let timer = null;
+    let stderrText = '';
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      resolveResult(result);
+    };
+
+    let child;
+    try {
+      child = spawn(command, args, {
+        detached: false,
+        stdio: ['ignore', 'ignore', 'pipe'],
+        env,
+      });
+    } catch (err) {
+      finish({ ok: false, error: err.message });
+      return;
+    }
+
+    if (child.stderr) {
+      child.stderr.on('data', (chunk) => {
+        if (!settled && stderrText.length < 1024) {
+          stderrText += chunk.toString('utf8').slice(0, 1024 - stderrText.length);
+        }
+      });
+    }
+
+    child.on('error', (err) => {
+      finish({ ok: false, error: err.message });
+    });
+
+    child.on('close', (code) => {
+      if (code === 0) {
+        finish({ ok: true });
+      } else {
+        finish({
+          ok: false,
+          error: stderrText.trim() || `${command} exited with code ${code}`,
+        });
+      }
+    });
+
+    timer = setTimeout(() => {
+      if (!settled) {
+        try {
+          child.kill();
+        } catch {
+          // ignore kill errors
+        }
+        finish({ ok: false, error: `${command} timeout` });
+      }
+    }, timeoutMs);
+  });
+}
+
+function pipeTextToClipboardTool(command, args, text, { timeoutMs = 2500, env } = {}) {
+  return new Promise((resolveResult) => {
+    let settled = false;
+    let timer = null;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      resolveResult(result);
+    };
+
+    let child;
+    try {
+      // Keep stdout/stderr ignored so clipboard fork daemons (xclip/wl-copy) do not hold pipes open.
+      child = spawn(command, args, {
+        detached: false,
+        stdio: ['pipe', 'ignore', 'ignore'],
+        env,
+      });
+    } catch (err) {
+      finish({ ok: false, error: err.message });
+      return;
+    }
+
+    if (child.stdin) {
+      child.stdin.on('error', () => {
+        // Prevent unhandled EPIPE if target tool is missing (ENOENT) or exits early.
+      });
+    }
+
+    child.on('error', (err) => {
+      finish({ ok: false, error: err.message });
+    });
+
+    child.on('close', (code) => {
+      if (code === 0) {
+        finish({ ok: true });
+      } else {
+        finish({ ok: false, error: `${command} exited with code ${code}` });
+      }
+    });
+
+    timer = setTimeout(() => {
+      if (!settled) {
+        try {
+          child.kill();
+        } catch {
+          // ignore kill errors
+        }
+        finish({ ok: false, error: `${command} timeout` });
+      }
+    }, timeoutMs);
+
+    try {
+      if (child.stdin) {
+        child.stdin.end(String(text), 'utf8');
+      }
+    } catch (err) {
+      finish({ ok: false, error: err.message });
+    }
+  });
+}
+
 // POST /api/action/open-default { path }
 app.api('/api/action/open-default', async (data) => {
   const actualPath = resolveExactPath(data.path);
@@ -593,24 +728,47 @@ app.api('/api/action/reveal', async (data) => {
   const currentPlatform = platform();
 
   try {
-    let result;
     if (currentPlatform === 'win32') {
       const { command, args, verbatim } = buildWinRevealArgs(absPath);
-      result = await spawnDetachedAndConfirm(command, args, {
+      const result = await spawnDetachedAndConfirm(command, args, {
         detached: true,
         stdio: 'ignore',
         windowsVerbatimArguments: !!verbatim,
       });
-    } else if (currentPlatform === 'darwin') {
-      result = await spawnDetachedAndConfirm('open', ['-R', absPath]);
-    } else {
-      result = await spawnDetachedAndConfirm('xdg-open', [dirname(absPath)]);
+      if (!result.ok) {
+        return { ok: false, error: result.error || '定位失败' };
+      }
+      return { ok: true, message: `已在资源管理器中高亮定位：${basename(absPath)}` };
     }
 
-    if (!result.ok) {
-      return { ok: false, error: result.error || '定位失败' };
+    if (currentPlatform === 'darwin') {
+      const { command, args } = buildMacRevealArgs(absPath);
+      const result = await spawnDetachedAndConfirm(command, args);
+      if (!result.ok) {
+        return { ok: false, error: result.error || '定位失败' };
+      }
+      return { ok: true, message: `已在访达（Finder）中高亮定位：${basename(absPath)}` };
     }
-    return { ok: true, message: `已在资源管理器中高亮定位：${basename(absPath)}` };
+
+    const revealChain = buildLinuxRevealChain(absPath);
+    let lastError = '';
+    for (const step of revealChain) {
+      if (step.mode === 'dbus') {
+        const res = await runCommandExpectZero(step.command, step.args, { timeoutMs: 2500 });
+        if (res.ok) {
+          return { ok: true, message: `已在文件管理器中高亮定位：${basename(absPath)}` };
+        }
+        lastError = res.error || lastError;
+      } else {
+        const res = await spawnDetachedAndConfirm(step.command, step.args);
+        if (res.ok) {
+          return { ok: true, message: `已在文件管理器中打开所在目录：${basename(absPath)}` };
+        }
+        lastError = res.error || lastError;
+      }
+    }
+
+    return { ok: false, error: lastError || '定位失败' };
   } catch (err) {
     console.error('[reveal] Failed:', err);
     return { ok: false, error: err.message };
@@ -618,15 +776,15 @@ app.api('/api/action/reveal', async (data) => {
 });
 
 // POST /api/action/copy-clipboard { text }
-app.api('/api/action/copy-clipboard', (data) => {
+app.api('/api/action/copy-clipboard', async (data) => {
   const text = data.text;
   if (!text) {
     return { ok: false, error: '文本内容为空' };
   }
 
-  return new Promise((resolveResult) => {
-    const currentPlatform = platform();
-    if (currentPlatform === 'win32') {
+  const currentPlatform = platform();
+  if (currentPlatform === 'win32') {
+    return new Promise((resolveResult) => {
       const fallbackExe = resolveWinFallbackPowerShellExe();
       const runClipboard = (exeOverride, allowFallback) => {
         const { command, args } = buildWinClipboardArgs(text, exeOverride);
@@ -644,22 +802,31 @@ app.api('/api/action/copy-clipboard', (data) => {
         });
       };
       runClipboard(undefined, true);
-    } else if (currentPlatform === 'darwin') {
-      const proc = execFile('pbcopy', [], (err) => {
-        if (err) resolveResult({ ok: false, error: err.message });
-        else resolveResult({ ok: true, message: '已复制到剪贴板' });
-      });
-      proc.stdin.write(text);
-      proc.stdin.end();
-    } else {
-      const proc = execFile('xclip', ['-selection', 'clipboard'], (err) => {
-        if (err) resolveResult({ ok: false, error: err.message });
-        else resolveResult({ ok: true, message: '已复制到剪贴板' });
-      });
-      proc.stdin.write(text);
-      proc.stdin.end();
+    });
+  }
+
+  if (currentPlatform === 'darwin') {
+    const res = await pipeTextToClipboardTool('pbcopy', [], text, {
+      env: buildMacUtf8Env(process.env),
+    });
+    if (!res.ok) {
+      console.error('[copy-clipboard] macOS pbcopy failed:', res.error);
+      return { ok: false, error: res.error || '复制失败' };
     }
-  });
+    return { ok: true, message: '已复制到剪贴板' };
+  }
+
+  const clipboardChain = buildLinuxClipboardChain(process.env);
+  const errors = [];
+  for (const step of clipboardChain) {
+    const res = await pipeTextToClipboardTool(step.command, step.args, text);
+    if (res.ok) {
+      return { ok: true, message: '已复制到剪贴板' };
+    }
+    errors.push(`${step.command}: ${res.error}`);
+  }
+  console.error('[copy-clipboard] Linux clipboard tools failed:', errors.join('; '));
+  return { ok: false, error: '未检测到可用的剪贴板工具（wl-copy / xclip / xsel）' };
 });
 
 app.run();

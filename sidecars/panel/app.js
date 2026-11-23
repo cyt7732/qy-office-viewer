@@ -3,6 +3,9 @@
 
 const sidecar = window.sidecar;
 const $ = (id) => document.getElementById(id);
+const CLIENT_PLATFORM = navigator.userAgentData?.platform || navigator.platform || navigator.userAgent || '';
+const IS_WINDOWS = /win/i.test(CLIENT_PLATFORM);
+const IS_MAC = /mac/i.test(CLIENT_PLATFORM);
 
 // ---------------------------------------------------------------------------
 // State
@@ -94,7 +97,8 @@ function getUrlParams() {
 }
 
 function normPath(p) {
-  return (p || '').replace(/\\/g, '/').toLowerCase();
+  const normalized = (p || '').replace(/\\/g, '/');
+  return IS_WINDOWS ? normalized.toLowerCase() : normalized;
 }
 
 function getBaseName(p) {
@@ -474,8 +478,9 @@ function updateButtonsState(file) {
     $('btn-open-label').textContent = label;
 
     if (hasRealPath) {
+      const revealLabel = IS_WINDOWS ? '资源管理器' : (IS_MAC ? '访达（Finder）' : '文件管理器');
       $('btn-open-default').title = `在系统默认程序中打开：${file.name}`;
-      $('btn-reveal').title = `在资源管理器中定位：${file.name}`;
+      $('btn-reveal').title = `在${revealLabel}中定位：${file.name}`;
       $('btn-copy-path').title = `复制绝对路径：${file.path}`;
     } else {
       $('btn-open-default').title = '拖放的内存文件无本地完整路径';

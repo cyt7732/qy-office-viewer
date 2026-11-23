@@ -4,6 +4,19 @@
 
 ---
 
+## [v1.2.2] - 2026-11-23
+
+### 新增与优化 (Added & Fixed)
+- **补齐 macOS 与 Linux 系统原生联动与防挂起加固**：
+  - **macOS**：`pbcopy` 显式注入 UTF-8 Locale 环境变量（`buildMacUtf8Env`），修复 GUI 子进程环境下复制中文路径乱码的问题；`/api/action/reveal` 通过 `open -R` 在访达（Finder）中高亮定位并返回专属提示文案。
+  - **Linux**：`/api/action/reveal` 新增三级定位链路——优先通过 Freedesktop D-Bus `org.freedesktop.FileManager1.ShowItems`（`gdbus` → `dbus-send`）在默认文件管理器中高亮选中目标文件，不支持时自动回退 `xdg-open` 打开父目录；`/api/action/copy-clipboard` 按 Wayland/X11 会话自适应切换 `wl-copy` / `xclip` / `xsel`，并使用 `stdio: ['pipe', 'ignore', 'ignore']` + `stdin` 错误监听杜绝剪贴板守护进程持锁挂死与 `EPIPE` 异常。
+- **前端跨平台细节适配**：
+  - `app.js` 按客户端系统动态区分「资源管理器 / 访达（Finder） / 文件管理器」提示文案，且 `normPath()` 仅在 Windows 忽略路径大小写，macOS/Linux 保留大小写精度；
+  - `index.html` 默认定位提示改为中性跨平台文案。
+- **跨平台同步脚本与文档**：新增纯 LF 换行的 `sync.sh`（macOS / Linux 一键同步部署），同步补齐 `sync.ps1` 的 `CHANGELOG.md` 复制及 `README.md` 三端部署指引。
+
+---
+
 ## [v1.2.1] - 2026-11-23
 
 ### 修复 (Fixed)
