@@ -4,6 +4,17 @@
 
 ---
 
+## [v1.2.1] - 2026-11-23
+
+### 修复 (Fixed)
+- **修复 Windows 无法唤起 WPS / 默认程序与资源管理器定位的回归问题**：
+  - 修复 `main.mjs` 中通过 `spawn(..., { detached: true })` 启动 `pwsh.exe` / `powershell.exe` 时，因 `DETACHED_PROCESS` 导致控制台宿主未执行脚本即静默退出（退出码 0）的问题，改为 `detached: false` + `windowsHide: true`，并结合 `.NET ProcessStartInfo`（`UseShellExecute = $true`）可靠触发 Win32 `ShellExecuteEx`；
+  - 新增子进程错误监听、退出码与 CLIXML 错误信息回传、3 秒防阻塞超时保护，以及 `pwsh` 启动失败自动回退至系统 `powershell.exe` 的兜底机制；
+  - 资源管理器定位（`/api/action/reveal`）改为直接以 `windowsVerbatimArguments: true` 唤起 `explorer.exe /select,"<path>"`（移除多余 PowerShell 中转与 `windowsHide: true`），兼顾毫秒级响应、特殊字符路径兼容与零命令注入风险；
+  - 修复 `resolveWinPowerShellExe()` 在 WindowsApps Store 版 `pwsh.exe`（App Execution Alias）上 `existsSync` 误判失效的问题，改用 `existsSync || lstatSync` 准确识别。
+
+---
+
 ## [v1.2.0] - 2026-11-22
 
 ### 修复 (Fixed)

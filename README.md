@@ -39,7 +39,7 @@
 - **智能变更监听与保位热重载**：
   - 后端基于 `fs.watch` 监听文件改动并提供内存态 `/api/file/watch-state`，前端温和感知并在文档保存后自动热重载，同时保留滚动位置、工作表标签与缩放状态；
   - 精准路径校验：当目标文件不存在时不再静默替换，而是明确提示并展示同目录相似候选供用户主动点击打开。
-- **按需加载与安全加固**：按文档类型懒加载离线渲染库，Windows 原生打开/定位/剪贴板采用 PowerShell `-EncodedCommand` 参数安全唤起，静态/文件接口带扩展名白名单校验。
+- **按需加载与安全加固**：按文档类型懒加载离线渲染库，Windows 原生打开/剪贴板采用 PowerShell `-EncodedCommand` 参数安全唤起，文件定位直调 `explorer.exe` 原字面参数，静态/文件接口带扩展名白名单校验。
 
 ---
 
@@ -105,6 +105,7 @@ pwsh -NoProfile -File .\sync.ps1
 
 | 版本 | 发布日期 | 核心亮点 |
 | :--- | :--- | :--- |
+| **[v1.2.1](https://github.com/cyt7732/qy-office-viewer/releases/tag/v1.2.1)** | 2026-11-23 | 修复 Windows 无法唤起 WPS/默认程序与资源管理器定位的回归问题，定位改为直调 `explorer.exe` 原字面参数并修复 Store 版 `pwsh` 识别与失败自动回退 |
 | **[v1.2.0](https://github.com/cyt7732/qy-office-viewer/releases/tag/v1.2.0)** | 2026-11-22 | 修复 Word 红头涂黑、静默误匹配、Excel 吸顶与 CSV 编码/拖拽、PDF CMap/懒渲染/划词复制、Windows 特殊字符命令注入、`fs.watch` 保位热重载与按需懒加载 |
 | **[v1.1.0](https://github.com/cyt7732/qy-office-viewer/releases/tag/v1.1.0)** | 2026-11-22 | 新增 PDF.js 离线高清多页渲染、Node 服务端无损 CJK 表格解析、自适应心跳热重载、紧凑顶栏重构与安全脱敏 |
 | **[v1.0.0](https://github.com/cyt7732/qy-office-viewer/releases/tag/v1.0.0)** | 2026-10-10 | 首个完整可用版本：Sidecar 胶囊路由、Word 离线仿真排版与自适应宽度、Excel 初版预览、系统程序非阻塞直开/定位/复制 |

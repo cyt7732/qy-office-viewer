@@ -20,6 +20,7 @@ import {
   isAllowedPreviewExt,
   isSpreadsheetExt,
   resolveExactPath,
+  resolveWinFallbackPowerShellExe,
   safeStat,
   sanitizeCmapFileName,
 } from './lib.mjs';
@@ -130,7 +131,7 @@ app.api('/api/vendor/cmap', async (data) => {
 // ---------------------------------------------------------------------------
 app.api('/api/status', () => ({
   name: 'qy-office-viewer',
-  version: '1.2.0',
+  version: '1.2.1',
   node: process.version,
   platform: `${platform()} ${release()}`,
   uptimeSeconds: Math.round((Date.now() - STARTED_AT) / 1000),
@@ -414,8 +415,145 @@ app.api('/api/file/spreadsheet', async (data) => {
 // Native System Actions (Safe Spawning without cmd.exe injection)
 // ---------------------------------------------------------------------------
 
+function cleanPsStderr(raw) {
+  if (!raw) return '';
+  let text = String(raw).trim();
+  if (text.startsWith('#< CLIXML')) {
+    const errMatches = [];
+    const re = /<S S="Error">([\s\S]*?)<\/S>/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      errMatches.push(m[1]);
+    }
+    text = errMatches.length > 0 ? errMatches.join(' ') : text.replace(/<[^>]+>/g, ' ');
+    text = text
+      .replace(/_x000D__x000A_/g, ' ')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&amp;/g, '&')
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'");
+  }
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+function spawnDetachedAndConfirm(command, args, options = {}) {
+  return new Promise((resolveResult) => {
+    let settled = false;
+    const finish = (result) => {
+      if (!settled) {
+        settled = true;
+        resolveResult(result);
+      }
+    };
+
+    try {
+      const child = spawn(command, args, {
+        detached: true,
+        stdio: 'ignore',
+        ...options,
+      });
+
+      child.on('error', (err) => {
+        console.error(`[spawn] ${command} error:`, err);
+        finish({ ok: false, error: err.message });
+      });
+
+      child.once('spawn', () => {
+        try {
+          child.unref();
+        } catch {
+          // ignore unref errors
+        }
+        finish({ ok: true });
+      });
+    } catch (err) {
+      finish({ ok: false, error: err.message });
+    }
+  });
+}
+
+function runWinPowerShellAction(buildArgsFn, { timeoutMs = 3000 } = {}) {
+  const fallbackExe = resolveWinFallbackPowerShellExe();
+
+  const attempt = (exeOverride, allowFallback) =>
+    new Promise((resolveResult) => {
+      let settled = false;
+      let timer = null;
+      let stderrText = '';
+
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        resolveResult(result);
+      };
+
+      const { command, args } = buildArgsFn(exeOverride);
+      let child;
+      try {
+        // Must keep detached: false on Windows so console-subsystem pwsh/powershell initializes properly.
+        child = spawn(command, args, {
+          detached: false,
+          stdio: ['ignore', 'ignore', 'pipe'],
+          windowsHide: true,
+        });
+      } catch (err) {
+        if (allowFallback && command.toLowerCase() !== fallbackExe.toLowerCase()) {
+          finish(attempt(fallbackExe, false));
+          return;
+        }
+        finish({ ok: false, error: err.message });
+        return;
+      }
+
+      if (child.stderr) {
+        child.stderr.on('data', (chunk) => {
+          if (!settled && stderrText.length < 2048) {
+            stderrText += chunk.toString('utf8').slice(0, 2048 - stderrText.length);
+          }
+        });
+      }
+
+      child.on('error', (err) => {
+        console.error(`[ps-action] ${command} error:`, err);
+        if (!settled && allowFallback && command.toLowerCase() !== fallbackExe.toLowerCase()) {
+          finish(attempt(fallbackExe, false));
+          return;
+        }
+        finish({ ok: false, error: err.message });
+      });
+
+      child.on('close', (code) => {
+        if (code === 0) {
+          finish({ ok: true });
+        } else {
+          const cleanErr = cleanPsStderr(stderrText) || `PowerShell exited with code ${code}`;
+          console.error(`[ps-action] ${command} failed (${code}):`, cleanErr);
+          finish({ ok: false, error: cleanErr });
+        }
+      });
+
+      timer = setTimeout(() => {
+        if (!settled) {
+          try {
+            child.unref();
+          } catch {
+            // ignore unref errors
+          }
+          finish({ ok: true });
+        }
+      }, timeoutMs);
+    });
+
+  return attempt(undefined, true);
+}
+
 // POST /api/action/open-default { path }
-app.api('/api/action/open-default', (data) => {
+app.api('/api/action/open-default', async (data) => {
   const actualPath = resolveExactPath(data.path);
   if (!actualPath) {
     return { ok: false, error: '文件不存在或路径无效' };
@@ -425,20 +563,17 @@ app.api('/api/action/open-default', (data) => {
   const currentPlatform = platform();
 
   try {
+    let result;
     if (currentPlatform === 'win32') {
-      const { command, args } = buildWinOpenArgs(absPath);
-      const child = spawn(command, args, {
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true,
-      });
-      child.unref();
+      result = await runWinPowerShellAction((exe) => buildWinOpenArgs(absPath, exe));
     } else if (currentPlatform === 'darwin') {
-      const child = spawn('open', [absPath], { detached: true, stdio: 'ignore' });
-      child.unref();
+      result = await spawnDetachedAndConfirm('open', [absPath]);
     } else {
-      const child = spawn('xdg-open', [absPath], { detached: true, stdio: 'ignore' });
-      child.unref();
+      result = await spawnDetachedAndConfirm('xdg-open', [absPath]);
+    }
+
+    if (!result.ok) {
+      return { ok: false, error: result.error || '打开失败' };
     }
     return { ok: true, message: `已在系统默认程序中打开：${basename(absPath)}` };
   } catch (err) {
@@ -448,7 +583,7 @@ app.api('/api/action/open-default', (data) => {
 });
 
 // POST /api/action/reveal { path }
-app.api('/api/action/reveal', (data) => {
+app.api('/api/action/reveal', async (data) => {
   const actualPath = resolveExactPath(data.path);
   if (!actualPath) {
     return { ok: false, error: '文件不存在或路径无效' };
@@ -458,20 +593,22 @@ app.api('/api/action/reveal', (data) => {
   const currentPlatform = platform();
 
   try {
+    let result;
     if (currentPlatform === 'win32') {
-      const { command, args } = buildWinRevealArgs(absPath);
-      const child = spawn(command, args, {
+      const { command, args, verbatim } = buildWinRevealArgs(absPath);
+      result = await spawnDetachedAndConfirm(command, args, {
         detached: true,
         stdio: 'ignore',
-        windowsHide: true,
+        windowsVerbatimArguments: !!verbatim,
       });
-      child.unref();
     } else if (currentPlatform === 'darwin') {
-      const child = spawn('open', ['-R', absPath], { detached: true, stdio: 'ignore' });
-      child.unref();
+      result = await spawnDetachedAndConfirm('open', ['-R', absPath]);
     } else {
-      const child = spawn('xdg-open', [dirname(absPath)], { detached: true, stdio: 'ignore' });
-      child.unref();
+      result = await spawnDetachedAndConfirm('xdg-open', [dirname(absPath)]);
+    }
+
+    if (!result.ok) {
+      return { ok: false, error: result.error || '定位失败' };
     }
     return { ok: true, message: `已在资源管理器中高亮定位：${basename(absPath)}` };
   } catch (err) {
@@ -490,15 +627,23 @@ app.api('/api/action/copy-clipboard', (data) => {
   return new Promise((resolveResult) => {
     const currentPlatform = platform();
     if (currentPlatform === 'win32') {
-      const { command, args } = buildWinClipboardArgs(text);
-      execFile(command, args, { windowsHide: true }, (err) => {
-        if (err) {
-          console.error('[copy-clipboard] Failed:', err);
-          resolveResult({ ok: false, error: err.message });
-        } else {
-          resolveResult({ ok: true, message: '已成功复制到系统剪贴板' });
-        }
-      });
+      const fallbackExe = resolveWinFallbackPowerShellExe();
+      const runClipboard = (exeOverride, allowFallback) => {
+        const { command, args } = buildWinClipboardArgs(text, exeOverride);
+        execFile(command, args, { windowsHide: true }, (err) => {
+          if (err) {
+            if (allowFallback && command.toLowerCase() !== fallbackExe.toLowerCase()) {
+              runClipboard(fallbackExe, false);
+              return;
+            }
+            console.error('[copy-clipboard] Failed:', err);
+            resolveResult({ ok: false, error: err.message });
+          } else {
+            resolveResult({ ok: true, message: '已成功复制到系统剪贴板' });
+          }
+        });
+      };
+      runClipboard(undefined, true);
     } else if (currentPlatform === 'darwin') {
       const proc = execFile('pbcopy', [], (err) => {
         if (err) resolveResult({ ok: false, error: err.message });

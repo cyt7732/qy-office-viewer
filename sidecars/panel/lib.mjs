@@ -1,7 +1,7 @@
 // QY Office Viewer - Pure Utility & Security Helpers
 // Shared between main.mjs and unit verification scripts.
 
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, statSync } from 'node:fs';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 
 export const ALLOWED_PREVIEW_EXTS = new Set([
@@ -237,9 +237,25 @@ export function sanitizeCmapFileName(name) {
 }
 
 // ---------------------------------------------------------------------------
-// Safe Windows PowerShell Command Builders (-EncodedCommand + single quotes)
+// Safe Windows PowerShell & Explorer Command Builders
 // ---------------------------------------------------------------------------
 let cachedPsExe = null;
+
+function canStatOrLstat(filePath) {
+  if (existsSync(filePath)) return true;
+  try {
+    lstatSync(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function resolveWinFallbackPowerShellExe() {
+  const systemRoot = process.env.SystemRoot || 'C:\\Windows';
+  const sysPs = join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  return existsSync(sysPs) ? sysPs : 'powershell.exe';
+}
 
 export function resolveWinPowerShellExe() {
   if (cachedPsExe) return cachedPsExe;
@@ -247,19 +263,19 @@ export function resolveWinPowerShellExe() {
   const pathEntries = (process.env.PATH || '').split(';').filter(Boolean);
   for (const dir of pathEntries) {
     const candidate = join(dir, 'pwsh.exe');
-    if (existsSync(candidate)) {
+    if (canStatOrLstat(candidate)) {
       cachedPsExe = candidate;
       return cachedPsExe;
     }
   }
 
   const programFilesPwsh = 'C:\\Program Files\\PowerShell\\7\\pwsh.exe';
-  if (existsSync(programFilesPwsh)) {
+  if (canStatOrLstat(programFilesPwsh)) {
     cachedPsExe = programFilesPwsh;
     return cachedPsExe;
   }
 
-  cachedPsExe = 'powershell.exe';
+  cachedPsExe = resolveWinFallbackPowerShellExe();
   return cachedPsExe;
 }
 
@@ -271,14 +287,12 @@ export function encodePsCommand(script) {
   return Buffer.from(String(script), 'utf16le').toString('base64');
 }
 
-function buildWinPsInvocation(script) {
+function buildWinPsInvocation(script, exeOverride) {
   return {
-    command: resolveWinPowerShellExe(),
+    command: exeOverride || resolveWinPowerShellExe(),
     args: [
       '-NoProfile',
       '-NonInteractive',
-      '-WindowStyle',
-      'Hidden',
       '-EncodedCommand',
       encodePsCommand(script),
     ],
@@ -286,20 +300,30 @@ function buildWinPsInvocation(script) {
   };
 }
 
-export function buildWinOpenArgs(absPath) {
+export function buildWinOpenArgs(absPath, exeOverride) {
   const escaped = escapePsSingleQuoted(absPath);
-  return buildWinPsInvocation(`Start-Process -FilePath '${escaped}'`);
+  const script = [
+    '$ErrorActionPreference = "Stop"',
+    '$psi = New-Object System.Diagnostics.ProcessStartInfo',
+    `$psi.FileName = '${escaped}'`,
+    '$psi.UseShellExecute = $true',
+    '[void][System.Diagnostics.Process]::Start($psi)',
+  ].join('; ');
+  return buildWinPsInvocation(script, exeOverride);
 }
 
 export function buildWinRevealArgs(absPath) {
   const cleanPath = String(absPath).replace(/"/g, '');
-  const escaped = escapePsSingleQuoted(cleanPath);
-  return buildWinPsInvocation(
-    `Start-Process -FilePath 'explorer.exe' -ArgumentList ('/select,"' + '${escaped}' + '"')`
-  );
+  const systemRoot = process.env.SystemRoot || 'C:\\Windows';
+  const explorerPath = join(systemRoot, 'explorer.exe');
+  return {
+    command: existsSync(explorerPath) ? explorerPath : 'explorer.exe',
+    args: [`/select,"${cleanPath}"`],
+    verbatim: true,
+  };
 }
 
-export function buildWinClipboardArgs(text) {
+export function buildWinClipboardArgs(text, exeOverride) {
   const escaped = escapePsSingleQuoted(text);
-  return buildWinPsInvocation(`Set-Clipboard -Value '${escaped}'`);
+  return buildWinPsInvocation(`Set-Clipboard -Value '${escaped}'`, exeOverride);
 }
